@@ -164,6 +164,49 @@ class SubstructurePenalizer:
             return False
         return rng.random() < p
 
+    # ── 2026-08-31: JQ 失败先验 (影子特征, 非否决) ────────
+
+    def fail_prior_for(self, formula: str) -> Dict:
+        """候选级 JQ 失败先验: 基于三元组 fail% 聚合。
+
+        设计 (P-20260831 分离力分析落地):
+        - 本地周频 pandas_icir 对 JQ 成败无分离力 (p=0.139);
+        - 子结构 fail% 是血统级 JQ 信号 (P-007 546 三元组带 jq_n/jq_fail);
+        - 本函数只产出影子特征, 不参与任何否决 (调用方决定用途)。
+
+        Returns:
+            {n_triplets, n_known, n_high_fail, fail_rate_pooled, coverage, prior_score}
+            prior_score = coverage*pooled + (1-coverage)*0.5  (未知三元组按中性 0.5)
+        """
+        empty = {"n_triplets": 0, "n_known": 0, "n_high_fail": 0,
+                 "fail_rate_pooled": None, "coverage": 0.0, "prior_score": 0.5}
+        if not self.table:
+            return empty
+        trips = self.extract_triplets(formula)
+        if not trips:
+            return empty
+        known = []
+        n_high = 0
+        for t in trips:
+            fr = self.jq_fail_rate(t)   # None = jq_n < JQ_MIN_N
+            if fr is not None:
+                known.append((fr, self.table[t]["jq_n"]))
+                if fr > JQ_BAD_FAIL_RATE:
+                    n_high += 1
+        n_triplets = len(trips)
+        n_known = len(known)
+        if n_known:
+            tot_fail = sum(fr * n for fr, n in known)
+            tot_n = sum(n for _, n in known)
+            pooled = tot_fail / max(tot_n, 1)
+        else:
+            pooled = None
+        coverage = n_known / n_triplets
+        prior = (coverage * pooled + (1 - coverage) * 0.5) if pooled is not None else 0.5
+        return {"n_triplets": n_triplets, "n_known": n_known, "n_high_fail": n_high,
+                "fail_rate_pooled": round(pooled, 4) if pooled is not None else None,
+                "coverage": round(coverage, 3), "prior_score": round(prior, 4)}
+
     # ── 审计输出 ────────────────────────────────────────
 
     def top_n(self, n: int = 10) -> List[Tuple[str, Dict]]:
@@ -203,3 +246,15 @@ def load_or_build_penalizer(formulas: Optional[List[str]] = None,
     if formulas:
         return build_penalizer_from_library(formulas, jq_records, enabled)
     return pz
+
+
+def compute_fail_prior_from_library(formula: str,
+                                    penalizer: Optional[SubstructurePenalizer] = None) -> Dict:
+    """便捷入口: 计算单公式的 JQ 失败先验 (影子特征, 非否决)。
+
+    penalizer=None 时从 data/substructure_freq.json 加载 (表缺失 → 全中性 0.5)。
+    调用方 (ralph_loop S1 影子记录) 需自行 try/except 包裹, 保证非阻塞。
+    """
+    if penalizer is None:
+        penalizer = load_or_build_penalizer()
+    return penalizer.fail_prior_for(formula)

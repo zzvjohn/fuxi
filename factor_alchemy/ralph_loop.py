@@ -1882,8 +1882,12 @@ class RalphLoop:
             if _ohlc_path.exists() and "stock_code" in df.columns and "trade_date" in df.columns:
                 try:
                     _ohlc = pd.read_parquet(_ohlc_path)
-                    _ohlc["trade_date"] = pd.to_datetime(_ohlc["trade_date"])
-                    df["trade_date"] = pd.to_datetime(df["trade_date"])
+                    _ohlc["trade_date"] = pd.to_datetime(
+                        _ohlc["trade_date"].astype(str).str.replace(r"\.0$", "", regex=True),
+                        format="mixed", errors="coerce")
+                    df["trade_date"] = pd.to_datetime(
+                        df["trade_date"].astype(str).str.replace(r"\.0$", "", regex=True),
+                        format="mixed", errors="coerce")
                     # 防御: drop 与主表重叠的列 (close 等), 避免 merge 产生 close_x/close_y
                     _drop = [c for c in _ohlc.columns
                              if c in df.columns and c not in ("stock_code", "trade_date")]
@@ -2618,6 +2622,44 @@ class RalphLoop:
                       f"(τ_w 门槛, 不重复日频裁决)")
         except Exception as e:
             print(f"  [伏羲] ⚠️ IC 计算失败: {e}，候选 S1 将被拒绝")
+
+        # ── 2026-08-31: 子结构 fail% 先验影子 (P-007 → 五元组影子特征, 非否决) ──
+        # 背景: 分离力分析证明本地周频 pandas_icir 对 JQ 成败无分离力 (p=0.139),
+        #   子结构 fail% 是血统级 JQ 信号, 先以影子字段随候选落盘, 4-8 周后归因。
+        try:
+            from substructure_frequency import compute_fail_prior_from_library
+            _pz_shadow = getattr(self.breeder, "penalizer", None)
+            _n_ss_known = 0
+            for cand in candidates:
+                _f = cand.get("formula", "") or ""
+                if not _f:
+                    cand["ss_fail_prior"] = 0.5
+                    cand["ss_coverage"] = 0.0
+                    cand["ss_n_known"] = 0
+                    cand["ss_n_high_fail"] = 0
+                    continue
+                try:
+                    _sp = compute_fail_prior_from_library(_f, penalizer=_pz_shadow)
+                except Exception:
+                    _sp = {"prior_score": 0.5, "coverage": 0.0, "n_known": 0, "n_high_fail": 0}
+                cand["ss_fail_prior"] = _sp["prior_score"]
+                cand["ss_coverage"] = _sp["coverage"]
+                cand["ss_n_known"] = _sp["n_known"]
+                cand["ss_n_high_fail"] = _sp["n_high_fail"]
+                if _sp["n_known"] > 0:
+                    _n_ss_known += 1
+            if _n_ss_known:
+                _ss_top = sorted(
+                    (c for c in candidates if c.get("ss_n_known")),
+                    key=lambda c: -c["ss_fail_prior"])[:3]
+                _ss_s = ", ".join(
+                    "%s(%s=%.2f)" % (str(c.get("factor_name", "?"))[:22],
+                                     "prior", c["ss_fail_prior"])
+                    for c in _ss_top)
+                print(f"  [SS-Prior] 子结构失败先验影子 ({_n_ss_known}/{len(candidates)}"
+                      f" 有JQ标签) Top: {_ss_s}")
+        except Exception as _spe:
+            print(f"  [SS-Prior] 先验计算失败 (非阻塞): {_spe}")
 
         # ── v0.5.2: S2 库内相关性计算 ──
         # 从 Memory 加载模板公式作为"库"，对无 max_corr 的候选计算真实相关性

@@ -125,6 +125,13 @@ class FactorICComputer:
         # 无 format 时 10 位格式解析成 NaT → 近期日期丢失 + 重复行 (与本地 load_data 对齐)
         df["trade_date"] = pd.to_datetime(df["trade_date"], format='mixed', errors="coerce")
         df = df.dropna(subset=["trade_date"])
+        # 2026-08-31 数据修复防线: 原文件曾含 6.4M 重复行 (两批拼接),
+        # 加载时强制去重 — 修复后文件无重复, 此行为零成本保险 (keep=last)。
+        _n0 = len(df)
+        df = df.drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
+        if len(df) < _n0:
+            print(f"  [IC Computer] ⚠️ 去重: {_n0 - len(df):,} 重复行已剔除 "
+                  f"(原始文件仍有重复, 建议重采)")
         # v0.9.2: lookback_days 对齐本地检验窗口 (默认 270 自然日 ≈ 190 交易日)
         if self.lookback_days is not None:
             start_dt = df["trade_date"].max() - pd.Timedelta(days=self.lookback_days)

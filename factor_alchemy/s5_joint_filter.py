@@ -221,11 +221,17 @@ class S5JointFilter:
             if col not in df.columns:
                 df[col] = 0  # 用0填充缺失列
         
-        df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+        # 2026-08-31 数据修复: 裸 to_datetime 对纯 int YYYYMMDD 列按纳秒解析→1970年
+        # (旧文件混格式侥幸读成 object 才没炸); 统一 astype(str)+mixed 双格式兼容。
+        df["trade_date"] = pd.to_datetime(
+            df["trade_date"].astype(str).str.replace(r"\.0$", "", regex=True),
+            format="mixed", errors="coerce")
         df = df.dropna(subset=["trade_date"])
         
         # 过滤日期范围 (有足够数据)
-        df = df[(df["trade_date"] >= "2020-01-01") & (df["trade_date"] <= "2026-08-07")]
+        # 2026-08-31 数据修复: 上限 08-07 为 8/8 遗留硬编码 (当时数据只到 08-07);
+        # 重采后数据至 08-28 (周五, 完整周), 对齐修复后数据末端。
+        df = df[(df["trade_date"] >= "2020-01-01") & (df["trade_date"] <= "2026-08-28")]
 
         # v0.9.3: 数值列转 float32 (rank 相关/回测精度无影响, 内存减半)
         for c in ["open", "high", "low", "close", "volume", "amount"]:
@@ -254,7 +260,9 @@ class S5JointFilter:
         # 加载中证500指数
         print(f"  [S5] Loading index data from {self.index_path}...")
         idx_df = pd.read_csv(self.index_path)
-        idx_df["trade_date"] = pd.to_datetime(idx_df["trade_date"], errors="coerce")
+        idx_df["trade_date"] = pd.to_datetime(
+            idx_df["trade_date"].astype(str).str.replace(r"\.0$", "", regex=True),
+            format="mixed", errors="coerce")
         idx_df = idx_df.dropna(subset=["trade_date"]).sort_values("trade_date")
         idx_df["idx_return"] = idx_df["close"].pct_change()
         self._index_df = idx_df

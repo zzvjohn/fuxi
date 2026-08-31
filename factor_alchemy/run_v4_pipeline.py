@@ -825,9 +825,14 @@ def run_view():
 
 def _load_jq_generator():
     """v0.9: 动态加载 scripts/gen_jq_generic.py (避免 sys.path 耦合)。"""
+    return _load_script_module("gen_jq_generic")
+
+
+def _load_script_module(name: str):
+    """动态加载 scripts/<name>.py 为独立模块 (importlib, 无 sys.path 污染)。"""
     import importlib.util
-    p = Path(__file__).parent.parent.parent / "scripts" / "gen_jq_generic.py"
-    spec = importlib.util.spec_from_file_location("gen_jq_generic", str(p))
+    p = Path(__file__).parent.parent.parent / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, str(p))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -931,6 +936,20 @@ def _auto_generate_jq_code(result: Dict, entry_map: Dict, ralph) -> List:
             report.append((name, "SKIP", reason))
 
     _save_jq_codegen_queue(queue)
+
+    # ── 2026-08-31: JQ 单因子 IC 快验批量脚本 (第二道证据门, 影子模式) ──
+    # 每周频候选入队后自动生成批量快验脚本 (纯因子 IC 计算, 无组合模拟),
+    # 用户可先跑快验 (秒级~分钟级) 再决定是否跑完整组合回测。
+    try:
+        _fic = _load_script_module("gen_jq_fast_ic")
+        _fic_out = _fic.build_batch_for_weekly_pending()
+        if _fic_out:
+            print(f"\n  [FAST-IC] 周频候选快验批量脚本已生成: {Path(_fic_out).name}")
+            print(f"  [FAST-IC] 先跑快验拿 JQ 周频 IC/ICIR (第二道门, "
+                  f"ENFORCE={_fic.FAST_IC_GATE_ENFORCE} 影子模式), "
+                  f"再过线者跑完整组合回测")
+    except Exception as _fic_e:
+        print(f"  [FAST-IC] 批量生成失败 (非阻塞): {_fic_e}")
 
     # ── 醒目通知块 (自动化 stdout / 工作台日报可见) ──
     if report:
