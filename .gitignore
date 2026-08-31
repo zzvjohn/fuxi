@@ -1,0 +1,26 @@
+# 凭据 — 永不提交
+.env
+
+# 运行时数据与产物
+data/
+output/
+outputs/
+logs/
+*.log
+*.json
+*.jsonl
+*.csv
+*.pkl
+*.parquet
+*.feather
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
