@@ -152,6 +152,14 @@ class LLMGenerator:
             parts.append("4. 禁止用日频直觉设计窗口: 周频 rolling(20) 已是 5 个月, 勿套用日频 20 日均线语义")
             parts.append("5. 表达式语法仍为 pandas Rolling 风格 (见下方语法要求)")
             parts.append("")
+            # P-20260901-004: 周频原生种子 few-shot 参考 (生成侧与裁决侧频率对齐)
+            try:
+                from weekly_seed_pool import format_prompt_reference
+                parts.append("## 🌱 周频原生种子参考 (结构风格示例, 请设计新的而非复制)")
+                parts.append(format_prompt_reference(max_n=6))
+                parts.append("")
+            except Exception:
+                pass
         else:
             parts.append("# A股量化因子生成任务")
             parts.append("")
@@ -419,18 +427,32 @@ class LLMGenerator:
             hypothesis = parts[2] if len(parts) > 2 else ""
             direction = parts[3].strip() if len(parts) > 3 else "+"
             
+            # 2026-09-01 修复: 剥掉 markdown 列表前导符 (LLM 常以 "- expr | name | ..."
+            # 或 "1. expr | ..." 输出, 前导 "- " 会被误当成公式取负 → 方向语义翻转)
+            _stripped = re.sub(r'^\s*[-*•]\s+', '', expression)
+            _stripped = re.sub(r'^\s*\d+[.)、]\s*', '', _stripped)
+            # 剥除后非空且仍像表达式 (不以裸运算符结尾/开头异常) 才采用
+            if _stripped and len(_stripped) > 2 and _stripped != expression:
+                expression = _stripped
+            
             # 标准化方向
             if direction in ("-", "short", "做空"):
                 direction = "short"
             else:
                 direction = "long"
             
-            candidates.append({
+            # 2026-09-01 修复: 管道分支与 JSON 分支统一走 _normalize_candidate,
+            # 保证候选 dict 含 factor_name/formula 键。
+            # (此前管道产物只有 expression/name, 下游 jq_candidate_details 的
+            #  cand_map 按 factor_name 匹配失败 → formula 空 → JQ codegen 全 SKIP)
+            cand = self._normalize_candidate({
                 "expression": expression,
                 "name": name,
                 "hypothesis": hypothesis,
                 "direction": direction,
             })
+            if cand:
+                candidates.append(cand)
         
         return candidates
     

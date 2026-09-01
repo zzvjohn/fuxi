@@ -731,7 +731,9 @@ class MultiStageValidator:
         results = [
             ValidationResult(
                 factor_name=c.get("factor_name", f"candidate_{i}"),
-                formula=c.get("formula", ""),
+                # 2026-09-01 防御: expression 兜底 (与 _phase_generate/_phase_evaluate
+                # 的双键读取口径一致), 防止上游候选缺 formula 键时结果公式丢失
+                formula=c.get("formula", c.get("expression", "")),
                 paradigm=c.get("paradigm", ""),
                 hypothesis=c.get("hypothesis", ""),
             )

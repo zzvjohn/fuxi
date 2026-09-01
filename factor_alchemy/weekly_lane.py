@@ -301,7 +301,6 @@ class WeeklyLaneJudge:
         mean_ic = float(np.nanmean(ic_arr))
         std_ic = float(np.nanstd(ic_arr))
         icir = abs(mean_ic / std_ic) if std_ic > 0 else 0.0
-
         # 活性校验: 近 activity_years 年 ICIR
         recent_cut = ic_series[-1][0] - pd.Timedelta(days=int(self.activity_years * 365.25))
         recent = [v for d, v in ic_series if d >= recent_cut]
@@ -337,7 +336,60 @@ class WeeklyLaneJudge:
             "eval_ok": True,
             # P-20260830-004: 市场状态条件化影子 (只输出不改判定)
             "state_shadow": self._state_conditioned_shadow(ic_series),
+            # P-20260831 P2: top-k 双口径 ICIR 影子 (Alpha2 top-k 高光备份移植)
+            "topk_shadow": self._topk_dual_caliber(ic_arr),
         }
+
+    # ── P-20260830-004: 市场状态条件化影子 ────────────────
+
+    def _topk_dual_caliber(self, ic_arr: np.ndarray) -> Dict:
+        """P-20260831 P2: top-k 双口径 ICIR 影子 (Alpha2 top-k 高光备份移植)。
+
+        动机: lane_calibration 实证「pandas 周频 ICIR 与 JQ 结果相关性弱
+        (FAILED 0.509 > PASS 0.183)」。假设 FAILED 高 ICIR 由少数尖峰周撑起,
+        稳健因子则各周均匀贡献。集中度比值 (ratio) 是尖峰噪声探针:
+
+          口径 A (现状):   icir    = |mean(IC)| / std(IC)
+          口径 B (top-k): icir_topk = |mean(最高 k 个同向贡献周 IC)| / std(全样本)
+          口径 C (trim):  icir_trim = |mean(剔除最差 25% 同向周后)| / std(全样本)
+          ratio = 口径X / 口径A — 越大说明 IC 越集中在少数高光周 (越脆弱)
+
+        纯影子输出: 不改 passed 判定。数据用途: 校准集锚点双口径积累,
+        检验 topk_ratio/trim_ratio 对 JQ PASS/FAILED 的分离力。
+        """
+        a = np.asarray(ic_arr, dtype=float)
+        n = len(a)
+        shadow = {"n": n, "k": 0, "icir": 0.0, "icir_topk": 0.0,
+                  "icir_trim": 0.0, "topk_ratio": None, "trim_ratio": None}
+        if n < 12:
+            return shadow
+        mean_ic = float(np.nanmean(a))
+        std_ic = float(np.nanstd(a))
+        base = abs(mean_ic / std_ic) if std_ic > 0 else 0.0
+        shadow["icir"] = round(base, 4)
+        if base == 0:
+            return shadow
+
+        # 同向贡献: 按因子方向翻转符号, 正值=与主方向一致的周
+        sgn = 1.0 if mean_ic >= 0 else -1.0
+        aligned = a * sgn  # 正值 = 同向贡献周
+        k = max(4, int(np.ceil(n * 0.2)))  # 高光周 = 20% 或至少 4 周
+        shadow["k"] = k
+
+        top_idx = np.argsort(-aligned)[:k]
+        top_mean = float(np.nanmean(a[top_idx]))
+        icir_topk = abs(top_mean / std_ic) if std_ic > 0 else 0.0
+        shadow["icir_topk"] = round(icir_topk, 4)
+        shadow["topk_ratio"] = round(icir_topk / base, 3) if base > 0 else None
+
+        cut = int(np.ceil(n * 0.25))
+        if n - cut >= 8:
+            keep = np.argsort(aligned)[cut:]
+            trim_mean = float(np.nanmean(a[keep]))
+            icir_trim = abs(trim_mean / std_ic) if std_ic > 0 else 0.0
+            shadow["icir_trim"] = round(icir_trim, 4)
+            shadow["trim_ratio"] = round(icir_trim / base, 3) if base > 0 else None
+        return shadow
 
     # ── P-20260830-004: 市场状态条件化影子 ────────────────
 

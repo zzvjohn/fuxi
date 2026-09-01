@@ -568,7 +568,9 @@ def generate_standalone(name, formula, meaning="", local_note="",
     for fld in meta["fields"]:
         if fld in ("close",):
             continue
-        jq_f = _FIELD_TO_JQ_FIELD[fld]
+        # P-20260901-001: prepare_factor 已把 amount→money 翻译, 此处 .get 幂等
+        # (原直接下标 KeyError: 'money' — chip_cost_zscore_volume_weighted 生成崩溃)
+        jq_f = _FIELD_TO_JQ_FIELD.get(fld, fld)
         extra += '''
     px_x = get_price(universe, count=lb, end_date=prev_date, frequency="daily",
                      fields="%s", skip_paused=False, fq="pre")

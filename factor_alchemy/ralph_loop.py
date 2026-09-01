@@ -37,6 +37,7 @@ v0.2 原有:
 """
 
 import sys
+import os
 import json
 import re
 import time
@@ -279,6 +280,16 @@ from forge.paradigm_profiles import MATURE_PARADIGM_PROFILES  # v0.7 P-025
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
 
 
+def _cfg_div_discount_w() -> float:
+    """P-20260831 P1: 多样性折扣权重 (config.DIV_DISCOUNT_W, 默认 0=关闭生产零变化)。
+    config 不可用/无此常量时静默回退 0.0 — 软引导, 绝不影响主流程。"""
+    try:
+        from config import DIV_DISCOUNT_W
+        return float(DIV_DISCOUNT_W or 0.0)
+    except Exception:
+        return 0.0
+
+
 class RalphLoop:
     """
     Ralph Loop v0.5 — 统一自进化发现引擎
@@ -344,6 +355,7 @@ class RalphLoop:
             max_depth=7, max_nodes=25,           # v0.6: 提升深度→缓解S5过度简化拦截
             penalizer=self.sub_penalizer,        # P-007: 高频子结构软拒绝
             edit_memory=self.edit_memory,        # P-20260827-001: SSPM 编辑记忆
+            diversity_w=_cfg_div_discount_w(),   # P-20260831 P1: 多样性折扣 (0=关闭)
         )
         self.parser = FactorExpressionParser()
 
@@ -372,7 +384,11 @@ class RalphLoop:
         }
         
         # v0.5.1: 生成器自动退避 — 连续失败追踪
-        self._breed_fail_streak = 0      # gp_breed/forge 连续 S5=0 的轮数
+        # 2026-09-01: 跨进程持久化 — 原实现每次进程启动 streak=0,
+        #   每轮独立进程 → 退避逃生舱永不触发 (8-31 实证: forge 连续 4 轮
+        #   S5=0 仍未强制 LLM, 每日自动化每轮新进程)。现落盘
+        #   data/breed_fail_streak.json, 跨轮累积。
+        self._breed_fail_streak = self._load_breed_fail_streak()
         self._last_generator = None       # 上一轮使用的生成器
         self._breed_fail_threshold = 2    # 连续失败阈值 → 触发 LLM 退避
         self._last_llm_paradigm = None    # LLM 退避时使用的范式
@@ -380,6 +396,38 @@ class RalphLoop:
         # v0.8: 种子主体重检 — 种子原式混入验证管线的配额与冷却
         self._max_seed_recheck = 5        # 每轮最多混入的种子数
         self._seed_recheck_cooloff_days = 30  # 同一种子重检冷却期
+
+    # ── 2026-09-01: 退避计数跨进程持久化 ──────────────────────
+    def _breed_streak_path(self) -> Path:
+        return DATA_DIR / "breed_fail_streak.json"
+
+    def _load_breed_fail_streak(self) -> int:
+        """读入历史连续失败轮数 (异常/缺失 → 0)。"""
+        try:
+            p = self._breed_streak_path()
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    v = int(data.get("streak", 0))
+                    return max(0, v)
+        except Exception:
+            pass
+        return 0
+
+    def _save_breed_fail_streak(self):
+        """落盘连续失败轮数 (异常静默, 不阻塞主流程)。"""
+        try:
+            p = self._breed_streak_path()
+            payload = {"streak": int(self._breed_fail_streak),
+                       "last_generator": self._last_generator,
+                       "threshold": self._breed_fail_threshold,
+                       "updated_at": datetime.now().isoformat()}
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False),
+                           encoding="utf-8")
+            os.replace(tmp, p)
+        except Exception:
+            pass
 
     # ═══════════════════════════════════════════════════════════
     # v0.6 实验接线 (评价宪法)
@@ -754,6 +802,7 @@ class RalphLoop:
             paradigm, max_candidates,
             use_fsa=use_fsa, use_reviewer=use_reviewer,
             gp_templates=gp_templates, evo_turns=evo_turns,
+            freq=freq,  # P-20260830-001 (2026-09-01 修复漏传 → LLM 路径 NameError)
         )
 
         # ── Phase E: Evaluate ─────────────────────────────
@@ -782,20 +831,25 @@ class RalphLoop:
         s5_count = evaluate_result.get("stage5_passed", 0)
         # 也检查 total_candidates vs eligible
         n_candidates = len(generate_result.get("candidates", []))
+        # 2026-09-01 修复: ValidationResult 字段是 s1_passed (原 stage1_passed 恒 False
+        # → n_passed_any_stage 恒 0 → LLM 轮退避计数永不重置, 退避逃生舱触发后无法回 MAB)
         n_passed_any_stage = sum(1 for r in evaluate_result.get("results", []) 
-                                 if getattr(r, 'stage1_passed', False))
+                                 if getattr(r, 's1_passed', False))
         
         if generator in ("gp_breed", "forge", "gp_breed_fallback"):
             if s5_count == 0 and n_candidates > 0:
                 self._breed_fail_streak += 1
+                self._save_breed_fail_streak()
                 print(f"  [退避] gp_breed/forge S5=0 连续 {self._breed_fail_streak} 轮 "
-                      f"(阈值={self._breed_fail_threshold})")
+                      f"(阈值={self._breed_fail_threshold}, 已持久化)")
             else:
                 self._breed_fail_streak = 0
+                self._save_breed_fail_streak()
         elif generator == "llm":
             # LLM 成功后重置 (即使 S5=0, LLM 生成的新因子也算注入新血统)
             if n_passed_any_stage > 0:
                 self._breed_fail_streak = 0
+                self._save_breed_fail_streak()
                 print(f"  [退避] LLM 注入成功 → 退避计数重置")
         self._last_generator = generator
 
@@ -865,13 +919,29 @@ class RalphLoop:
                               f"最大集中度 {fsa_report.max_concentration:.1%}")
 
         # v0.9: JQ 候选详情 (公式/来源/种子标记) — 供 run_v4_pipeline 自动生成 JQ 代码
+        # 2026-09-01 修复: cand_map 按 factor_name 匹配失败时 (候选缺 factor_name 键,
+        # validator 给过 candidate_N 兜底名), 按 validate 的 enumerate 索引回退取原候选,
+        # 并从 expression 双键兜底公式 — 根治 JQ codegen "无公式" 全 SKIP
         cand_map = {c.get("factor_name"): c for c in generate_result["candidates"]}
+        gen_cand_list = generate_result["candidates"]
         jq_candidate_details = []
         for r in eligible:
             cand = cand_map.get(r.factor_name, {})
+            _fn = str(getattr(r, "factor_name", ""))
+            if not cand and _fn.startswith("candidate_"):
+                try:
+                    _idx = int(_fn.split("_", 1)[1])
+                    if 0 <= _idx < len(gen_cand_list):
+                        cand = gen_cand_list[_idx]
+                except (ValueError, IndexError):
+                    cand = {}
             jq_candidate_details.append({
                 "factor_name": r.factor_name,
-                "formula": cand.get("formula", getattr(r, "formula", "")),
+                "formula": (
+                    cand.get("formula")
+                    or cand.get("expression")
+                    or getattr(r, "formula", "")
+                ),
                 "formula_original": cand.get("_formula_original", ""),
                 "paradigm": cand.get("paradigm", getattr(r, "paradigm", "")),
                 "hypothesis": cand.get("hypothesis", ""),
@@ -1066,6 +1136,7 @@ class RalphLoop:
         use_reviewer: bool = True,
         gp_templates: Optional[List[Dict]] = None,
         evo_turns: int = 5,
+        freq: str = "",  # P-20260830-001: "weekly" 时 LLM 周频语境 (2026-09-01 修复漏传 NameError)
     ) -> Dict:
         """
         G 阶段: 生成候选因子 (v0.5: MAB 方向选择 + 统一 FactorQualityGate)。
@@ -2780,6 +2851,49 @@ class RalphLoop:
         except Exception as e:
             print(f"  [S2] ⚠️ 相关性计算失败: {e}，S2 将静默通过")
 
+        # ── P-20260831 P1: 多样性折扣影子 (Alpha2 MaxCorr 移植) ──
+        # 对候选计算 vs【JQ 正面验证】因子的最大 |rank corr| (jq_max_corr),
+        # 只落盘影子字段不改变任何裁决 (铁则: local 仅否决不排序)。
+        # 数据用途: 观察哪些候选在复制已验证信号, 为 enforce 转正积累证据。
+        try:
+            from forge import diversity_discount as _dd
+            _div_mode = _dd.get_mode()
+            if _div_mode != "off" and ic_comp is not None:
+                _dc = _dd.get_shared_cache(ic_comp=ic_comp)
+                _n_ref = _dc.reference_size()
+                if _n_ref > 0:
+                    _div_pending_f, _div_pending_n, _div_pending_c = [], [], []
+                    for cand in candidates:
+                        _f = cand.get("formula", cand.get("expression", ""))
+                        if _f and not cand.get("_seed_recheck"):
+                            _div_pending_f.append(_f)
+                            _div_pending_n.append(cand.get("factor_name", ""))
+                            _div_pending_c.append(cand)
+                    if _div_pending_f:
+                        _corrs = _dc.get_corrs_batch(_div_pending_f, _div_pending_n)
+                        for cand in _div_pending_c:
+                            _n = cand.get("factor_name", "")
+                            _c = _corrs.get(_n, 0.0)
+                            cand["jq_max_corr"] = round(_c, 4)
+                            cand["jq_div_discount"] = round(
+                                _dd.discount_factor(_c), 4)
+                            if abs(float(cand.get("ic", 0)) or 0) > 1e-8:
+                                cand["jq_div_adj_score"] = round(
+                                    abs(float(cand["ic"])) * _dd.discount_factor(_c), 6)
+                        _top = sorted(_div_pending_c,
+                                      key=lambda c: -c.get("jq_max_corr", 0))[:3]
+                        _ts = ", ".join(
+                            "%s(corr=%.2f)" % (str(c.get("factor_name", "?"))[:20],
+                                               c.get("jq_max_corr", 0))
+                            for c in _top)
+                        _snap = _dd.COUNTERS.snapshot()
+                        print(f"  [DivDisc] {_div_mode} 模式: JQ参照 {_n_ref} 因子, "
+                              f"候选 {len(_div_pending_f)} 已算 jq_max_corr "
+                              f"(累计查询 {_snap['n_queries']}, 成功 {_snap['n_corr_computed']}, "
+                              f"自命中 {_snap['n_self_hit']}) Top占用: {_ts}")
+        except Exception as _de:
+            print(f"  [DivDisc] ⚠️ 影子计算失败 (非阻塞): {_de}")
+
         # ── v0.5.2: S5 回测过滤器 + 轻量回退 ──
         s5_filter = None
         s5_fallback = False
@@ -2896,9 +3010,20 @@ class RalphLoop:
                     else:
                         _resid = 0.0
                     self.edit_memory.record(_para, _op, _resid)
+                    # P-20260901-005: 父因子上下文层 (影子, 只记录不裁决)
+                    _em = _cand.get("edit_meta") or {}
+                    for _pf in (_em.get("parents") or []):
+                        if _pf:
+                            self.edit_memory.record_parent(
+                                _pf, _op, _resid,
+                                child_formula=_cand.get("formula", ""))
                     _n_sspm += 1
                 if _n_sspm:
                     print(self.edit_memory.summary())
+                    try:
+                        print(self.edit_memory.parent_overlap_report())
+                    except Exception:
+                        pass
             except Exception as _sse:
                 print(f"  [SSPM] 残差回填失败 (非阻塞): {_sse}")
 

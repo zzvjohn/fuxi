@@ -373,16 +373,72 @@ def _pick_terminal(rng: np.random.RandomState, terminal_weights: Dict = None):
     return ExprNode(_weighted_pick(rng, INPUT_PRIMITIVES, terminal_weights))
 
 
+# ═══════════════════════════════════════════════════════
+# P-20260831: 维度一致性预剪枝门 (Alpha2 移植)
+# ═══════════════════════════════════════════════════════
+
+_dim_cache: dict = {}  # 子树字符串 → 根量纲 (生成期缓存, 避免重复遍历)
+
+
+def _resolve_dim_mode(dim_prune):
+    """dim_prune=None 时读模块默认模式 (env FUXI_DIM_PRUNE, 默认 shadow)"""
+    if dim_prune is None:
+        from forge import dimension_rules as dr
+        return dr.get_mode()
+    return dim_prune
+
+
+def _child_dim(node: ExprNode) -> str:
+    """子树根量纲 (带缓存; 超限清空防长跑内存膨胀)"""
+    global _dim_cache
+    if len(_dim_cache) > 200_000:
+        _dim_cache.clear()
+    key = node.to_string()
+    if key not in _dim_cache:
+        from forge import dimension_rules as dr
+        _dim_cache[key] = dr.dim_of_node(node)
+    return _dim_cache[key]
+
+
+def _dim_gate(p_name: str, children: List[ExprNode], dim_prune: str):
+    """剪枝门: 返回 (allowed, hard)。
+    off: 直接放行; shadow: 只计数不拦截; enforce: hard 违规返回 allowed=False。
+    """
+    if dim_prune == "off":
+        return True, False
+    from forge import dimension_rules as dr
+    dims = tuple(_child_dim(c) for c in children)
+    r = dr.apply_op(p_name, list(dims))
+    if r.hard:
+        dr.COUNTERS.record(p_name, dims, True, False)
+        return (dim_prune != "enforce"), True
+    if r.soft:
+        dr.COUNTERS.record(p_name, dims, False, True)
+    return True, False
+
+
+def _dim_retry_ok(p_name: str, children: List[ExprNode]) -> bool:
+    """enforce 重采样路径: 只判断不计数 (首次违规已由 _dim_gate 计数)"""
+    from forge import dimension_rules as dr
+    dims = tuple(_child_dim(c) for c in children)
+    return not dr.apply_op(p_name, list(dims)).hard
+
+
 def grow_random_tree(rng: np.random.RandomState,
                      max_depth: int = 4,
                      include_ts: bool = True,
                      include_cs: bool = True,
                      terminal_weights: Dict = None,
-                     op_weights: Dict = None) -> ExprNode:
+                     op_weights: Dict = None,
+                     dim_prune: str = None) -> ExprNode:
     """Grow 方法: 随机生成完整树 (所有分支填满到max_depth或随机停止)
 
     v0.7: terminal_weights/op_weights 支持范式定向生成 (P-025)。
+    P-20260831: dim_prune ∈ {off, shadow, enforce} — 维度一致性预剪枝。
+      shadow(默认): 只计数不拦截; enforce: hard 违规重采样, 兜底退化为终端。
     """
+    dim_prune = _resolve_dim_mode(dim_prune)
+
     def _grow(depth: int, min_depth: int) -> ExprNode:
         if depth >= max_depth or (depth >= min_depth and rng.random() < 0.4):
             # 终端
@@ -401,8 +457,19 @@ def grow_random_tree(rng: np.random.RandomState,
                 c1 = ExprNode(
                     Primitive(str(w), None, 0, 0, is_input=False)
                 )
-            else:
-                c1 = _grow(depth + 1, min_depth)
+                return ExprNode(p, [c0, c1])
+            c1 = _grow(depth + 1, min_depth)
+            allowed, hard = _dim_gate(p.name, [c0, c1], dim_prune)
+            if hard and not allowed:
+                # enforce: 重采样第二子节点, 失败则整体退化为终端
+                ok = False
+                for _ in range(4):
+                    c1 = _grow(depth + 1, min_depth)
+                    if _dim_retry_ok(p.name, [c0, c1]):
+                        ok = True
+                        break
+                if not ok:
+                    return _pick_terminal(rng, terminal_weights)
             return ExprNode(p, [c0, c1])
         return _pick_terminal(rng, terminal_weights)
 
@@ -412,8 +479,12 @@ def grow_random_tree(rng: np.random.RandomState,
 def full_random_tree(rng: np.random.RandomState,
                      max_depth: int = 4,
                      terminal_weights: Dict = None,
-                     op_weights: Dict = None) -> ExprNode:
-    """Full 方法: 所有叶节点在同一深度 (v0.7: 支持范式偏置)"""
+                     op_weights: Dict = None,
+                     dim_prune: str = None) -> ExprNode:
+    """Full 方法: 所有叶节点在同一深度
+    (v0.7: 支持范式偏置; P-20260831: dim_prune 维度预剪枝)
+    """
+    dim_prune = _resolve_dim_mode(dim_prune)
 
     def _full(depth: int) -> ExprNode:
         if depth >= max_depth:
@@ -427,8 +498,18 @@ def full_random_tree(rng: np.random.RandomState,
             if p.name.startswith("ts_"):
                 w = rng.choice(WINDOW_SIZES)
                 c1 = ExprNode(Primitive(str(w), None, 0, 0, is_input=False))
-            else:
-                c1 = _full(depth + 1)
+                return ExprNode(p, [c0, c1])
+            c1 = _full(depth + 1)
+            allowed, hard = _dim_gate(p.name, [c0, c1], dim_prune)
+            if hard and not allowed:
+                ok = False
+                for _ in range(4):
+                    c1 = _full(depth + 1)
+                    if _dim_retry_ok(p.name, [c0, c1]):
+                        ok = True
+                        break
+                if not ok:
+                    return _pick_terminal(rng, terminal_weights)
             return ExprNode(p, [c0, c1])
         return _pick_terminal(rng, terminal_weights)
 

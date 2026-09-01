@@ -1161,6 +1161,8 @@ class GPBreeder:
         penalty_retry: int = 6,  # P-007: 软拒绝后重试上限 (耗尽放行防死循环)
         layered_selection: bool = True,  # P-20260826-005: 分层奖励父本采样 (False=均匀采样回退)
         edit_memory: Optional[Any] = None,  # P-20260827-001: SSPM 编辑记忆 (None=关闭, 行为与改造前一致)
+        dim_prune: Optional[str] = None,  # P-20260831: off/shadow/enforce 维度预剪枝 (None=读 env)
+        diversity_w: float = 0.0,  # P-20260831 P1: Alpha2 多样性折扣权重 (0=关闭; 0.10 建议)
     ):
         self.parser = parser or FactorExpressionParser()
         self.max_depth = max_depth
@@ -1170,6 +1172,17 @@ class GPBreeder:
         self.penalty_retry = penalty_retry  # P-007: 软拒绝重试次数
         self.layered_selection = layered_selection  # P-20260826-005: 分层奖励父本采样
         self.edit_memory = edit_memory  # P-20260827-001: SSPMEditMemory 或 None
+        # P-20260831: 维度预剪枝状态 (shadow 只计数, enforce 拒绝硬违规子代)
+        try:
+            from forge import dimension_rules as _dr
+            self.dim_prune = dim_prune if dim_prune is not None else _dr.get_mode()
+        except ImportError:
+            self.dim_prune = "off"
+        self.dim_hard: int = 0
+        self.dim_soft: int = 0
+        # P-20260831 P1: 多样性折扣 (Alpha2 MaxCorr 移植, w>0 才启用查询)
+        self.diversity_w = diversity_w
+        self._div_cache = None  # JQDiversityCache 惰性创建
         if seed is not None:
             random.seed(seed)
 
@@ -1179,13 +1192,16 @@ class GPBreeder:
 
     # ── P-20260826-005: 分层奖励父本采样 ─────────────────
 
-    def _layered_template_score(self, meta) -> float:
+    def _layered_template_score(self, meta, precomputed_corr=None) -> float:
         """模板分层奖励得分 (L2 稳健 + L3 稀缺), clamp [0.2, 1.0]
 
         L2 稳健: verification_level (jq_single > jq_composite > s5_passed > stage2_only)
                  + success_rate (模板历史通过率)
         L3 稀缺: 1/(1 + 0.3 × occurrence_count) — 库内出现越多越拥挤, 越该让位
         元数据完全缺失时返回 0.5 (中性, 均匀退化)。
+
+        precomputed_corr (2026-09-01 转正配套): _layered_template_weights 批量
+        预查询的 jq_max_corr (避免逐模板单查 → 每查重 eval 整个参照库)。
         """
         lv, sr, occ = 'stage2_only', 0.0, 0
         if isinstance(meta, dict):
@@ -1212,12 +1228,65 @@ class GPBreeder:
                   'stage2_only': 0.5, '': 0.4}
         l2 = l2_map.get(lv, 0.4) * 0.7 + min(max(sr, 0.0), 1.0) * 0.3
         l3 = 1.0 / (1.0 + 0.3 * occ)
-        return max(0.2, min(1.0, 0.6 * l2 + 0.4 * l3))
+        score = max(0.2, min(1.0, 0.6 * l2 + 0.4 * l3))
+
+        # P-20260831 P1: 多样性折扣 (Alpha2 MaxCorr 移植) —
+        # 与已 JQ 正面验证因子高相关的模板降采样, 引导变异远离已占用方向。
+        # shadow: 只进统计不改 score; enforce: score *= max(0.5, 1 - w·corr)。
+        if self.diversity_w > 0:
+            try:
+                from forge import diversity_discount as _dd
+                if precomputed_corr is None:
+                    fml = ""
+                    mname = ""
+                    if isinstance(meta, dict):
+                        fml = str(meta.get("formula", meta.get("expression", "")) or "")
+                        mname = str(meta.get("factor_name", meta.get("pattern_id", "")) or "")
+                    elif meta is not None:
+                        fml = str(getattr(meta, "formula",
+                                          getattr(meta, "expression", "")) or "")
+                        mname = str(getattr(meta, "factor_name",
+                                            getattr(meta, "pattern_id", "")) or "")
+                    if fml:
+                        if self._div_cache is None:
+                            self._div_cache = _dd.get_shared_cache()
+                        precomputed_corr = self._div_cache.get_corr(fml, mname)
+                if _dd.is_enforce():
+                    score = _dd.apply_discount(score, precomputed_corr or 0.0,
+                                               w=self.diversity_w)
+            except Exception:
+                pass  # 折扣任何异常都不影响主流程 (软引导)
+        return score
 
     def _layered_template_weights(self, metas) -> List[float]:
         if not self.layered_selection:
             return [1.0] * len(metas)
-        return [self._layered_template_score(m) for m in metas]
+        # 2026-09-01 P1 转正配套: 批量预查询 jq_max_corr —
+        # 逐模板单查每查重 eval 整个 JQ 参照库 (~20 公式全市场 eval),
+        # 模板池 100+ 时冷启动需数十分钟; 批量一次只 eval 参照库一遍。
+        _fmls, _names = [], []
+        for m in metas:
+            if isinstance(m, dict):
+                fml = str(m.get("formula", m.get("expression", "")) or "")
+                nm = str(m.get("factor_name", m.get("pattern_id", "")) or "")
+            elif m is not None:
+                fml = str(getattr(m, "formula", getattr(m, "expression", "")) or "")
+                nm = str(getattr(m, "factor_name", getattr(m, "pattern_id", "")) or "")
+            else:
+                fml, nm = "", ""
+            _fmls.append(fml)
+            _names.append(nm or f"tpl_{len(_names)}")
+        corr_map = {}
+        if self.diversity_w > 0:
+            try:
+                from forge import diversity_discount as _dd
+                if self._div_cache is None:
+                    self._div_cache = _dd.get_shared_cache()
+                corr_map = self._div_cache.get_corrs_batch(_fmls, _names)
+            except Exception:
+                corr_map = {}
+        return [self._layered_template_score(m, corr_map.get(n))
+                for m, n in zip(metas, _names)]
 
     def _layered_parent_choice(self, trees, weights):
         """分层加权父本选择 (权重退化均匀时行为等价 random.choice)"""
@@ -1517,6 +1586,8 @@ class GPBreeder:
 
         while len(children) < n_children and attempts < max_attempts:
             attempts += 1
+            # P-20260901-005: 父因子上下文 (编辑模式记忆影子, 随候选落盘)
+            _parents = []
             # v0.4D: Thompson Sampling 算子选择
             # P-20260827-001: 透传 MAB 方向标签供 SSPM 条件化否决
             op = self._choose_operator_thompson(paradigm)
@@ -1545,12 +1616,15 @@ class GPBreeder:
                     p1 = random.choice(trees)
                     p2 = random.choice(trees)
                 child = self.crossover(p1, p2, fsa)
+                _parents = [p1.to_expression(), p2.to_expression()]
             elif op == "mutate":
                 parent = self._layered_parent_choice(trees, parent_weights)
                 child = self.mutate(parent, fsa)
+                _parents = [parent.to_expression()]
             else:
                 parent = self._layered_parent_choice(trees, parent_weights)
                 child = self.perturb(parent)
+                _parents = [parent.to_expression()]
 
             if child and child.node_count() <= self.max_nodes:
                 # v0.3.1: 输出 pandas infix 格式（兼容 S5 eval）
@@ -1580,6 +1654,21 @@ class GPBreeder:
                 
                 # v0.3.2: 公式清理（修正常见的 crossover 产物）
                 expr = self._cleanup_formula(expr)
+
+                # P-20260831: 维度一致性审计 (shadow 计数 / enforce 拒绝硬违规)
+                if self.dim_prune != "off":
+                    try:
+                        from forge import dimension_rules as _dr
+                        _aud = _dr.audit_fet_node(child, record=False)
+                        if _aud is not None:
+                            if _aud.n_hard:
+                                self.dim_hard += 1
+                                if self.dim_prune == "enforce":
+                                    continue
+                            if _aud.n_soft:
+                                self.dim_soft += 1
+                    except ImportError:
+                        pass
                 
                 # v0.3.2: 验证字段引用
                 if output_format == "pandas":
@@ -1624,11 +1713,16 @@ class GPBreeder:
                     "hypothesis": f"GP {op} from template pool",
                     "paradigm": paradigm or "auto_breed",  # v0.9.1: MAB 方向透传 (修复 auto_breed 断链)
                     "motifs": child_motifs,  # v0.5 P-001: 子代 motif 标注
+                    "edit_meta": {"parents": _parents, "op": op},  # P-20260901-005 影子
                 })
                 _breed_counter += 1  # v0.6: 持久化递增
 
         # v0.6: 保存最新编号
         self._save_breed_counter(_breed_counter)
+        # P-20260831: 维度审计摘要 (shadow 计数 / enforce 拦截)
+        if self.dim_prune != "off" and (self.dim_hard or self.dim_soft):
+            print(f"  [DimPrune:{self.dim_prune}] hard={self.dim_hard} "
+                  f"soft={self.dim_soft} (维度一致性审计)")
         return children
 
     @staticmethod

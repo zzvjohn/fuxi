@@ -456,6 +456,16 @@ V06_EXPERIMENTAL = {
     "strategy_spec_enabled": True,
 }
 
+# ==================== P1 多样性折扣 (2026-08-31, Alpha2 MaxCorr 移植) ====================
+# 折扣: 父本模板分层采样权重 × max(0.5, 1 - w·jq_max_corr),
+#   jq_max_corr = 模板 vs【JQ 正面验证】因子的最大 |逐日截面 rank corr|。
+# 参照集只含 JQ_PASSED/JQ_MARGINAL/PASS (防 926a 式方向翻转传播)。
+# w=0.0 = 关闭 (生产零行为变化); 转正建议 0.10 (对比报告 0.05~0.15 中值)。
+# 生效还需 env FUXI_DIV_DISCOUNT=enforce (默认 shadow 只记录不改行为, SOP 同 P0)。
+# 🔴 2026-09-01 已转正: w=0.10 (影子验收硬证据: 53% 育种模板与 JQ 验证因子 corr>0.8,
+#   8 个 corr=1.00 纯复制; 软引导只降采样不改裁决, 异常安全。回退 = 改回 0.0)
+DIV_DISCOUNT_W = 0.10
+
 # ==================== v0.7 频率对称双通道 (2026-08-29) ====================
 # 架构 (v07_forge_s1_calibration_plan_20260829.md v3):
 #   生成层频率中立 (LLM/gp_breed 双语境) × 裁决层 S1 分频 XOR 路由 × 执行层 S5/S6/JQ 唯一周频口径

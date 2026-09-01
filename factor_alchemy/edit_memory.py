@@ -150,3 +150,71 @@ class SSPMEditMemory:
         veto = [f"{p}×{m}" for p, m in self.vetoed_pairs()]
         veto_s = f" | 否决: {'; '.join(veto[:5])}" if veto else ""
         return f"  [SSPM] 编辑记忆 {len(rows)} 对 | {head}{veto_s} (hard_veto={self.hard_veto_enabled})"
+
+    # ── P-20260901-005: 父因子上下文层 (影子, 只记录不裁决) ──────────────────
+    # AlphaMemo 式编辑模式记忆下沉: (父因子公式, edit_mode) → 残差信用。
+    # 与 (paradigm, mode) 层并行独立存储, 供后续观察与现有 motif forbid-prefer
+    # 的重叠率分析; 不参与 should_veto (转正需另行开关)。
+
+    def record_parent(self, parent_formula: str, edit_mode: str,
+                      residual: float, child_formula: str = "") -> None:
+        """记录一次「父因子上下文×编辑模式」的残差 (JSONL 影子日志)。"""
+        if edit_mode not in EDIT_MODES:
+            return
+        if not parent_formula:
+            return
+        try:
+            residual = float(residual)
+        except (TypeError, ValueError):
+            return
+        try:
+            import time
+            log_path = Path(self.path).parent / "edit_motif_parent_log.jsonl"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "parent": str(parent_formula)[:500],
+                    "edit_mode": edit_mode,
+                    "child": str(child_formula)[:500],
+                    "residual": residual,
+                }, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"  [EditParent] ⚠️ 影子日志写入失败 (非阻塞): {e}")
+
+    def parent_context_stats(self) -> Dict[str, Dict]:
+        """聚合父因子上下文层: {(parent|mode): {n, mean, m2}} (读 JSONL 重算)。"""
+        from collections import defaultdict
+        agg = {}
+        log_path = Path(self.path).parent / "edit_motif_parent_log.jsonl"
+        if not log_path.exists():
+            return agg
+        try:
+            with open(log_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    key = f"{rec['parent'][:60]}|{rec['edit_mode']}"
+                    st = agg.setdefault(key, {"n": 0.0, "mean": 0.0, "m2": 0.0})
+                    n = st["n"] + 1.0
+                    delta = rec["residual"] - st["mean"]
+                    st["mean"] = st["mean"] + delta / n
+                    st["m2"] = st["m2"] + delta * (rec["residual"] - st["mean"])
+                    st["n"] = n
+        except Exception:
+            pass
+        return agg
+
+    def parent_overlap_report(self, top_n: int = 10) -> str:
+        """父因子上下文统计摘要 (影子观察, 不裁决)。"""
+        agg = self.parent_context_stats()
+        if not agg:
+            return "  [EditParent] 父因子上下文层暂无观测 (影子)"
+        rows = sorted(agg.items(), key=lambda kv: (kv[1]["n"], kv[1]["mean"]))
+        head = ", ".join(
+            f"{p[:24]}×{m}={st['mean']:+.2f}(n={int(st['n'])})"
+            for p, st in rows[-top_n:]
+            for m in [p.split("|")[1]] if "|" in p
+        )
+        return f"  [EditParent] 父因子上下文 {len(agg)} 对 (影子, 不裁决) | 样本最多: {head}"

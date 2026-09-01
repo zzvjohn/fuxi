@@ -49,7 +49,8 @@ class FactorForge:
                  fsa=None, fsa_retry: int = 3,
                  paradigm_profiles: Optional[Dict[str, Dict]] = None,
                  penalizer: Optional[Any] = None,
-                 edit_memory: Optional[Any] = None):  # P-20260827-001: SSPM 编辑记忆 (None=关闭)
+                 edit_memory: Optional[Any] = None,
+                 dim_prune: Optional[str] = None):  # P-20260831: Alpha2 维度预剪枝
         """
         Args:
             data: 输入数据 {'open','high','low','close','volume','vwap','returns'} (T,N)
@@ -67,6 +68,8 @@ class FactorForge:
             paradigm_profiles: v0.7 P-025: {范式名: {terminal_weights, op_weights}}
                               范式定向初始化 — 种群按范式轮流分配, 交叉/变异继承范式标签
             penalizer: P-007: SubstructurePenalizer 实例 (高频子结构软拒绝, 与 FSA 并列)
+            dim_prune: P-20260831: off/shadow/enforce (None=读 FUXI_DIM_PRUNE, 默认 shadow)
+                       维度一致性预剪枝 (Alpha2 移植, 影子→对照→转正)
         """
         self.data = data
         self.vault = vault
@@ -93,6 +96,12 @@ class FactorForge:
         self.edit_memory = edit_memory
         self.sspm_vetos: int = 0            # SSPM 否决拦截次数 (审计)
         self.sspm_observed: int = 0         # SSPM 残差记录次数 (审计)
+
+        # P-20260831: Alpha2 维度一致性预剪枝
+        from forge import dimension_rules as _dr
+        self.dim_prune = dim_prune if dim_prune is not None else _dr.get_mode()
+        self.dim_hard: int = 0              # 整树硬违规拦截/计数
+        self.dim_soft: int = 0              # 整树软标记计数
 
         # v0.7 P-025: 范式定向
         self.paradigm_profiles = paradigm_profiles or {}
@@ -122,9 +131,27 @@ class FactorForge:
             ow = prof.get("op_weights")
         if kind == "full":
             return full_random_tree(self.rng, self.max_depth,
-                                    terminal_weights=tw, op_weights=ow)
+                                    terminal_weights=tw, op_weights=ow,
+                                    dim_prune=self.dim_prune)
         return grow_random_tree(self.rng, self.max_depth,
-                                terminal_weights=tw, op_weights=ow)
+                                terminal_weights=tw, op_weights=ow,
+                                dim_prune=self.dim_prune)
+
+    def _dim_audit(self, tree: ExprNode) -> bool:
+        """P-20260831: 整树维度审计。
+        返回 clean (无硬违规)。shadow: 只计数; enforce: 违规者由调用方拒绝重生成。
+        """
+        if self.dim_prune == "off":
+            return True
+        from forge import dimension_rules as dr
+        res = dr.audit_forge_node(tree, record=False)
+        if res is None:
+            return True
+        if res.n_hard:
+            self.dim_hard += 1
+        if res.n_soft:
+            self.dim_soft += 1
+        return res.clean
 
     def _skeleton(self, tree: ExprNode) -> Optional[str]:
         """提取树的 FSA 结构骨架 (解析失败返回 None)"""
@@ -157,6 +184,9 @@ class FactorForge:
             # P-007: 高频子结构软拒绝 (高频∧JQ差 → 降采样; 高频但JQ好 → 保留)
             if self.penalizer and self.penalizer.should_reject(t.to_string(), self.rng):
                 self.sub_blocks += 1
+                continue
+            # P-20260831: 维度硬违规 (enforce 拒绝重生成; shadow 只计数)
+            if not self._dim_audit(t) and self.dim_prune == "enforce":
                 continue
             return t
         self.fsa_blocks += 1
@@ -396,6 +426,14 @@ class FactorForge:
                         child = alt
                     edited = False
 
+                # P-20260831: 维度硬违规 (enforce: 子代重生成; shadow: 只计数)
+                if not self._dim_audit(child) and self.dim_prune == "enforce":
+                    alt = self._gen_tree_fsa_guarded("grow", child_tag)
+                    if alt is None:
+                        alt = self._make_tree(child_tag, "grow")
+                    child = alt
+                    edited = False
+
                 next_pop.append(child)
                 next_tags.append(child_tag)
 
@@ -415,6 +453,10 @@ class FactorForge:
         if verbose:
             print(f"  Forge 完成: {n_generations}代, {elapsed:.0f}s, "
                   f"最佳 ICIR={best_all[-1]['icir']:+.3f}")
+            if self.dim_prune != "off" and (self.dim_hard or self.dim_soft):
+                _verb = "拦截重生成" if self.dim_prune == "enforce" else "影子计数"
+                print(f"  [DimPrune:{self.dim_prune}] hard={self.dim_hard} "
+                      f"soft={self.dim_soft} (维度一致性审计, {_verb})")
 
         # ── v0.7 P-025: 暴露最终种群供挖掘 ──
         # 旧实现只导出每代最优 (5 条), 整个种群的次优解从未被利用。
@@ -483,6 +525,10 @@ class FactorForge:
             "n_qualified": len(qualified),
             "n_novel": len(novel),
             "per_paradigm": per_paradigm,
+            # P-20260831: 维度剪枝审计 (shadow 计数 / enforce 拦截)
+            "dim_prune_mode": self.dim_prune,
+            "dim_hard": self.dim_hard,
+            "dim_soft": self.dim_soft,
         }
         if verbose and self.fsa is not None:
             print(f"  [FSA] 拦截 {self.fsa_blocks} 次, "
@@ -688,6 +734,7 @@ class FactorForge:
             new_subtree = grow_random_tree(
                 self.rng,
                 max_depth=min(3, self.max_depth),
+                dim_prune=self.dim_prune,
             )
             mutant = self._replace_subtree(mutant, target, new_subtree)
         return mutant

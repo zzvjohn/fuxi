@@ -318,7 +318,11 @@ class ExperienceMemory:
             existing = self.data["attempts"][existing_idx]
             attempt_id = existing["id"]
             # 更新 fields
-            existing["formula"] = formula[:500]
+            # P-20260901-006: 修复 formula[:500] 截断 bug — 超500字符公式被截断
+            # 产生括号不配平(如 volume_crowding_divergence 结尾 crowding_sp 缺 ike),
+            # 导致 DivDisc 参照集 eval 失败。改为 5000 字符上限(公式合理长度上限,
+            # 实际公式最长 ~2-3K 字符, 5000 不会真截断任何合理公式)。
+            existing["formula"] = formula[:5000]
             existing["paradigm"] = paradigm
             existing["category"] = category
             existing["outcome"] = outcome
@@ -348,7 +352,7 @@ class ExperienceMemory:
         record = {
             "id": attempt_id,
             "factor_name": factor_name,
-            "formula": formula[:500],          # 截断以防过长
+            "formula": formula[:5000],          # P-20260901-006: 原 [:500] 截断损坏长公式, 改 5000
             "paradigm": paradigm,
             "category": category,
             "outcome": outcome,

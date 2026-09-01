@@ -761,6 +761,18 @@ class FactorICComputer:
 
         full_globals = {"__builtins__": safe_builtins, **base_context, **wide_env}
 
+        # P-20260901-002: df['field'] 宽表引用自动改写 → field
+        #   (volume_price_microstructure_entropy_regime 等 4 因子挂起根因:
+        #   向量化环境无 df 变量; 宽表列名即字段名, df['close']→close 语义等价)
+        _df_col_re = re.compile(r"""df\s*\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\]""")
+
+        def _df_rewrite(s: str) -> str:
+            return _df_col_re.sub(
+                lambda m: m.group(1) if m.group(1) in wide_env else m.group(0), s)
+
+        body_lines = [_df_rewrite(ln) for ln in body_lines]
+        clean = _df_rewrite(clean)
+
         try:
             # 中间赋值行 (多行公式) 写入命名空间
             for ln in body_lines:
@@ -923,12 +935,19 @@ class FactorICComputer:
         candidate_formulas: List[str],
         library_factors: List[Dict],
         candidate_names: Optional[List[str]] = None,
+        sample_stocks: int = 0,
     ) -> Dict[str, tuple]:
         """
         批量版 compute_max_corr_vs_library (v0.6.1 修复 S2 性能/稳定性):
         - 库模板只 eval 一次并缓存 (旧版每候选重算全部库模板 → NxM 次重复 eval)
         - eval 失败的坏模板预筛剔除, 不再对每个候选重复失败
         - 候选公式也只 eval 一次
+
+        sample_stocks (2026-09-01 P1 转正配套): >0 时按固定种子 (42) 抽取
+        sample_stocks 只股票做相关计算 (与 FactorICComputer IC 口径一致的
+        120 只) — 多样性折扣是软引导信号, 不需要全市场精度;
+        全市场 5763×1500天 groupby 每对 ~2s, 育种模板池 100+ 模板冷启动
+        需 ~60min; 采样后 ~80s。默认 0 = 全市场 (S2 门禁等既有调用方不变)。
 
         Returns:
             {candidate_name: (max_corr, max_corr_factor)}
@@ -944,6 +963,27 @@ class FactorICComputer:
                 out[n] = (0.0, "")
             return out
 
+        # 0) 采样股票集合 (固定种子, 跨库/候选一致)
+        sample_codes: Optional[set] = None
+        if sample_stocks and sample_stocks > 0:
+            try:
+                if not self._loaded:
+                    self._load_data()
+                rng = np.random.RandomState(42)
+                codes = sorted(self._universe)
+                if len(codes) > sample_stocks:
+                    sample_codes = set(rng.choice(codes, size=sample_stocks,
+                                                  replace=False))
+                else:
+                    sample_codes = set(codes)
+            except Exception:
+                sample_codes = None  # 采样失败退回全市场
+
+        def _filter_df(df):
+            if df is None or sample_codes is None:
+                return df
+            return df[df["ts_code"].isin(sample_codes)]
+
         # 1) 库模板探活 + 缓存 (坏模板一次性剔除)
         lib_cache: List[tuple] = []  # (lib_name, factor_df)
         for lib in library_factors:
@@ -951,7 +991,7 @@ class FactorICComputer:
             lib_name = lib.get("factor_name", lib.get("pattern_id", ""))
             if not lib_formula or not lib_name:
                 continue
-            df = self._eval_formula(str(lib_formula), str(lib_name))
+            df = _filter_df(self._eval_formula(str(lib_formula), str(lib_name)))
             if df is None or len(df) == 0:
                 continue  # 坏模板: _eval_formula 已打印失败日志, 此处静默剔除
             lib_cache.append((str(lib_name), df))
@@ -968,7 +1008,7 @@ class FactorICComputer:
             if name in [ln for ln, _ in lib_cache]:
                 out[name] = (0.0, "")  # 跳过自身
                 continue
-            cand_df = self._eval_formula(str(formula), str(name))
+            cand_df = _filter_df(self._eval_formula(str(formula), str(name)))
             if cand_df is None or len(cand_df) == 0:
                 out[name] = (-1.0, "")
                 continue

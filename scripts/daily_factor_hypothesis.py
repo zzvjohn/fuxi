@@ -316,6 +316,21 @@ def validate_and_preprocess_formula(formula: str, factor_name: str = "") -> tupl
                 f"已在 eval 上下文中覆盖为 DataFrame, 可正常执行"
             )
 
+    # ── 4. Python 语法检查 (括号配平 / 表达式合法性) ──
+    # P-20260901-007: ast.parse 预检, 提前拒绝括号不配平等语法错误公式,
+    # 避免 eval 阶段 SyntaxError 后误剪枝有效提案。
+    # 实证: margin_flow_volume_ratio_zscore 公式 (A-A).rolling(...) 缺括号配平,
+    #       预检漏过 → eval 报 unmatched ')' → 被 prune_stage1_proposals 剪枝。
+    import ast as _ast
+    try:
+        _ast.parse(formula, mode='eval')
+    except SyntaxError:
+        try:
+            _ast.parse(formula, mode='exec')
+        except SyntaxError as _se:
+            warnings.append(f"公式语法错误 (括号不配平或非法表达式): {_se.msg}")
+            return False, warnings, formula
+
     return True, warnings, formula
 
 

@@ -9,6 +9,7 @@ DeepSeek LLM API 客户端 — 伏羲系统统一 LLM 调用接口
   - 超时保护
 """
 
+import os
 import time
 import json
 import urllib.request
@@ -19,7 +20,9 @@ from typing import Optional, List, Dict
 
 # ─── 默认配置 ───────────────────────────────────────────
 
-DEFAULT_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")  # 通过环境变量注入, 禁止硬编码
+# 统一 DeepSeek API Key (2026-08-31 用户指定):
+# 仅从环境变量 DEEPSEEK_API_KEY 读取; 未设置时为空串, 须配置后方可调用
+DEFAULT_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")  # 通过环境变量注入, 禁止硬编码兜底
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-chat"
 DEFAULT_TIMEOUT = 120  # 秒

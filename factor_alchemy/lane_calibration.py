@@ -168,6 +168,27 @@ def review_pandas_icir(formula: str, factor_name: str = "") -> Tuple[Optional[fl
     return None, r.get("reason", "eval fail")
 
 
+def review_pandas_full(formula: str, factor_name: str = "") -> Optional[Dict]:
+    """P-20260831 P2: 完整复评结果 (含 topk 双口径影子)。eval 失败返回 None。"""
+    try:
+        judge = _build_review_judge()
+    except Exception:
+        return None
+    r = judge.judge(formula, factor_name)
+    if not r.get("eval_ok"):
+        return None
+    ts = r.get("topk_shadow") or {}
+    return {
+        "weekly_icir": float(r["weekly_icir"]),
+        "weekly_n": int(r.get("weekly_n", 0)),
+        "topk_icir": ts.get("icir_topk"),
+        "topk_ratio": ts.get("topk_ratio"),
+        "trim_icir": ts.get("icir_trim"),
+        "trim_ratio": ts.get("trim_ratio"),
+        "topk_k": ts.get("k"),
+    }
+
+
 # ═══════════════════════════════════════════════════════
 # 4. D+ 反馈 → 校准集 upsert (幂等)
 # ═══════════════════════════════════════════════════════
@@ -202,16 +223,33 @@ def update_from_jq_feedback(factors: List[Dict], path=None) -> Dict:
         p_icir, p_note = review_pandas_icir(formula, f.get("factor_name", ""))
         if p_icir is not None:
             n_eval_ok += 1
-
-        new_jq = {
-            "jq_outcome": outcome,
-            "jq_return": f.get("jq_return"),
-            "jq_sharpe": f.get("jq_sharpe"),
-            "jq_maxdd": f.get("jq_maxdd"),
-            # P-001 (2026-08-29): 补存 JQ 单因子 IC/ICIR, 是 τ_w 校准最宝贵的 JQ 口径锚点
-            "jq_ic": f.get("jq_ic"),
-            "jq_icir": f.get("jq_icir"),
-        }
+        # P-20260831 P2: top-k 双口径影子 (集中度比值 = 尖峰噪声探针, 纯观察)
+        p_full = review_pandas_full(formula, f.get("factor_name", ""))
+        if p_full is not None:
+            new_jq = {
+                "jq_outcome": outcome,
+                "jq_return": f.get("jq_return"),
+                "jq_sharpe": f.get("jq_sharpe"),
+                "jq_maxdd": f.get("jq_maxdd"),
+                # P-001 (2026-08-29): 补存 JQ 单因子 IC/ICIR, 是 τ_w 校准最宝贵的 JQ 口径锚点
+                "jq_ic": f.get("jq_ic"),
+                "jq_icir": f.get("jq_icir"),
+                # P2: top-k 双口径影子字段
+                "topk_icir": p_full.get("topk_icir"),
+                "topk_ratio": p_full.get("topk_ratio"),
+                "trim_icir": p_full.get("trim_icir"),
+                "trim_ratio": p_full.get("trim_ratio"),
+                "topk_k": p_full.get("topk_k"),
+            }
+        else:
+            new_jq = {
+                "jq_outcome": outcome,
+                "jq_return": f.get("jq_return"),
+                "jq_sharpe": f.get("jq_sharpe"),
+                "jq_maxdd": f.get("jq_maxdd"),
+                "jq_ic": f.get("jq_ic"),
+                "jq_icir": f.get("jq_icir"),
+            }
         existing = by_key.get(key)
         if existing is None:
             point = {
