@@ -200,6 +200,32 @@ def infer_lookback(formula, default=100):
     return max(30, min(250, lb))
 
 
+def infer_lookback_weekly(formula, slack_weeks=15, floor_weeks=12):
+    """周频语义下的 lookback (**周数**) — P-20260917-026。
+
+    🔴 为何不复用 infer_lookback: 它的 `2*max_window` 松弛是为**日频**
+    「窗口并列/边界」设计的。周频宽表由策略内 daily→W-SUN resample 得到
+    (每 5 个日频行才产出 1 周), 沿用同一松弛会把日频行数需求无谓放大 5 倍,
+    导致本可生成的因子被上限拒绝 (实测 forge_gen4 链: infer_lookback=135 周
+    ⇒ 700 日 > 上限)。
+
+    此处改用**串行链真实需求** (所有窗口求和, 因为嵌套 rolling 是逐层消耗行数的)
+    + 固定 slack(周):
+
+        周数 = Σ(rolling + shift + pct_change + ewm) + slack_weeks
+
+    下限 floor_weeks (默认 12 周 ≈ 1 季, resample 后至少要有 12 周才可能出非 NaN)。
+    """
+    roll_w = [int(x) for x in re.findall(r"rolling\((\d+)", formula)]
+    shift_w = [int(x) for x in re.findall(r"shift\((\d+)", formula)]
+    pc_w = [int(x) for x in re.findall(r"pct_change\((\d+)", formula)]
+    ewm_w = [int(x) for x in re.findall(r"ewm\(span=(\d+)", formula)]
+    serial = sum(roll_w) + sum(shift_w) + sum(pc_w) + sum(ewm_w)
+    if serial <= 0:
+        return int(floor_weeks)
+    return max(int(floor_weeks), int(serial) + int(slack_weeks))
+
+
 def infer_univ_cap(lookback, n_fields):
     """按 5.5 万行/周 铁律反推股票池上限 (close + 额外字段的 get_price 行数总和)。
 
@@ -210,36 +236,89 @@ def infer_univ_cap(lookback, n_fields):
     return max(400, min(1500, cap))
 
 
-def _build_generic_func(name, formula, meaning, minlen, req_fields):
+def _build_generic_func(name, formula, meaning, minlen, req_fields,
+                        weekly_semantics=False):
     """生成向量化因子函数源码 (镜像 S5 引擎的宽表 DataFrame 语义)。
 
     2026-08-17 事故修复: 旧版 per-stock eval 循环在 JQ 旧 pandas 环境
     (rank(pct=True)+NaN 行为差异) 返回 valid=0 → 组合无收益。
     改为全池一次 DataFrame 运算取最后一行横截面 — 与 v3_overreaction_reversal
     (JQ 实测 285 周正常) 同模式, 且与 S5 引擎 (wide pivots + eval) 数学完全等价。
+    P-20260901-007 修复: _LOCALS 的 pick key 必须用 JQ 字段名
+    (amount→money), 否则 _pick("amount") 取 None→nan_df→公式全 NaN→valid=0
+    (chip_cost_zscore_volume_weighted / vwap_dev_ratio_5_60 无组合收益实证)。
+
+    P-20260917-026 (周频语义): weekly_semantics=True 时先把日频宽表重采样为
+    **周频宽表** (W-SUN 周期末, 聚合方式与 weekly_panel._RAW_AGGS 逐条一致:
+    open=first/high=max/low=min/close=last/volume=sum/amount=sum) 再求值
+    ⇒ 窗口保持**周语义** (rolling(60)=60 周), 与 weekly lane / Forge 周频建模
+    同口径。修复前 rolling(60) 在日频宽表上退化为 60 日 = 5x 错位。
     """
     fname = "factor_" + re.sub(r"\W", "_", name)
     esc = formula.replace('"""', "'")
+    def _pk(fld):
+        jq_k = _FIELD_TO_JQ_FIELD.get(fld, fld)
+        return '_pick("%s")' % jq_k
+    if weekly_semantics:
+        _agg_lit = ", ".join(
+            '"%s": "%s"' % (k, v) for k, v in WEEKLY_AGG_MAP.items())
+        wk_block = (
+            ("    _WK_AGG = {%s}  # 与 weekly_panel._RAW_AGGS 一致"
+             " (P-20260917-026)\n" % _agg_lit)
+            + "    def _wk(df, how):\n"
+            "        \"\"\"日频宽表 → 周频宽表 (W-SUN 周期末)。\n"
+            "        P-20260917-026: weekly-native 因子必须在周线上求值, 否则\n"
+            "        rolling(60) 从「60 周」退化为「60 日」= 5x 窗口语义错位。\"\"\"\n"
+            "        if df is None or not isinstance(df, pd.DataFrame) or df.shape[0] == 0:\n"
+            "            return df\n"
+            "        try:\n"
+            "            o = df.copy()\n"
+            "            o.index = pd.to_datetime(o.index)\n"
+            "            return getattr(o.resample(\"W\"), how)()\n"
+            "        except Exception:\n"
+            "            return df\n"
+            "    close_df = _wk(close_df, \"last\")\n"
+            "    nan_df = pd.DataFrame(np.nan, index=close_df.index,\n"
+            "                          columns=close_df.columns)\n"
+        )
+        pick_ret = "        return _wk(df, _WK_AGG.get(key, \"last\"))\n"
+        wsdoc = ("    周频语义 (P-20260917-026): 日频宽表已重采样为周频宽表 (W-SUN),\n"
+                 "    窗口为周语义 (rolling(N) = N 周), 与 weekly lane 同口径\n")
+    else:
+        wk_block = ""
+        pick_ret = "        return df\n"
+        wsdoc = ""
+    locals_src = (
+        "    _LOCALS = {\n"
+        '        "close": close_df, "open": %(open)s, "high": %(high)s,\n'
+        '        "low": %(low)s, "volume": %(volume)s, "amount": %(amount)s,\n'
+        '        "close_p": close_df, "open_p": %(open)s, "high_p": %(high)s,\n'
+        '        "low_p": %(low)s, "volume_p": %(volume)s, "amount_p": %(amount)s,\n'
+        '        "returns": close_df.pct_change(),\n'
+        "    }\n"
+    ) % {
+        "open": _pk("open"), "high": _pk("high"), "low": _pk("low"),
+        "volume": _pk("volume"), "amount": _pk("amount"),
+    }
     body = (
         'def %(fname)s(stocks, close_df, extra_dfs=None):\n'
         '    """%(meaning)s\n'
         '    公式 (S5 通过口径): %(esc)s\n'
         '    向量化实现 (与 S5 引擎宽表语义一致): 全池一次 DataFrame 运算, 取最后一行横截面\n'
-        '    HIGH = 做多 (与 S5JointFilter.backtest_factor ascending=False 一致)"""\n'
+        '    HIGH = 做多 (与 S5JointFilter.backtest_factor ascending=False 一致)\n'
+        '%(wsdoc)s'
+        '    """\n'
         "    nan_df = pd.DataFrame(np.nan, index=close_df.index, columns=close_df.columns)\n"
         "    ex = extra_dfs or {}\n"
+        "    _BASE_IDX = close_df.index\n"
+        "%(wk_block)s"
         "    def _pick(key):\n"
         "        df = ex.get(key)\n"
         "        if df is None:\n"
         "            return nan_df\n"
-        "        return df.reindex(index=close_df.index, columns=close_df.columns)\n"
-        "    _LOCALS = {\n"
-        '        "close": close_df, "open": _pick("open"), "high": _pick("high"),\n'
-        '        "low": _pick("low"), "volume": _pick("volume"), "amount": _pick("amount"),\n'
-        '        "close_p": close_df, "open_p": _pick("open"), "high_p": _pick("high"),\n'
-        '        "low_p": _pick("low"), "volume_p": _pick("volume"), "amount_p": _pick("amount"),\n'
-        '        "returns": close_df.pct_change(),\n'
-        "    }\n"
+        "        df = df.reindex(index=_BASE_IDX, columns=close_df.columns)\n"
+        "%(pick_ret)s"
+        "%(locals_src)s"
         "    val = eval(_EXPR, _GLOBALS, _LOCALS)\n"
         "    if isinstance(val, pd.DataFrame):\n"
         "        last = val.iloc[-1]\n"
@@ -252,6 +331,8 @@ def _build_generic_func(name, formula, meaning, minlen, req_fields):
         "    return arr, valid"
     ) % {
         "fname": fname, "meaning": meaning or "(自动生成)", "esc": esc,
+        "wk_block": wk_block, "pick_ret": pick_ret, "wsdoc": wsdoc,
+        "locals_src": locals_src,
     }
     return fname, body
 
@@ -342,6 +423,22 @@ _RANK_PCT_HELPER = '''def _rank_pct(obj):
 '''
 
 
+# P-20260917-026: 日频宽表 → 周频宽表的聚合方式
+# 🔴 单一事实源: 必须与 research/factor_alchemy/weekly_panel._RAW_AGGS 逐条一致
+# (weekly lane / Forge 周频建模的权威聚合), 由 _verify_026_weekly 断言对拍。
+WEEKLY_AGG_MAP = {
+    "open": "first", "high": "max", "low": "min",
+    "close": "last", "volume": "sum", "amount": "sum",
+}
+
+# P-20260917-026: 周频语义模式下 JQ get_price 可接受的日频行数上限。
+# 周频窗口链 w 周 ⇒ 需 w*5 + 25 日频行 (5 交易日/周 + resample 边界 buffer)。
+# 超出即**拒绝生成**, 而非截断 (截断会静默产出全 NaN 因子 = 无组合收益事故)。
+# 520 → 600: 周频语义下「周窗口链 w 周」需 w*5+25 日频行; 实测
+# forge_gen4 (Σ窗口=85 周) 需 85+15=100 周 ⇒ 525 日, 原 520 会误拒。
+_JQ_WEEKLY_LB_CAP = int(os.environ.get("FUXI_JQ_WEEKLY_LB_CAP", "600"))
+
+
 def detect_window_semantics(formula):
     """P-20260814-003: 检测公式中的长窗口 rolling/ewm/shift.
 
@@ -366,8 +463,18 @@ def detect_window_semantics(formula):
     return found
 
 
-def prepare_factor(name, formula, meaning="", local_note="", lookback=None):
-    """公式 → 生成元数据 (或错误).
+def prepare_factor(name, formula, meaning="", local_note="", lookback=None,
+                   weekly_semantics=False):
+    """公式 → 生成元数据 (或错误)。
+
+    Parameters
+    ----------
+    weekly_semantics : bool
+        P-20260917-026. True = 该因子原始验证频率为**周频**(natural_freq=weekly),
+        生成的回测将在**周频宽表**上求值 ⇒:
+          - 公式窗口保持周语义 (rolling(60)=60 周, 不做任何窗口改写)
+          - lookback 需按「周数 × 5 交易日/周 + buffer」换算为日频行数
+            (JQ get_price 只能按日频取数, 周频宽表由策略内 resample 得到)
 
     Returns:
         dict(ok=True, file/name/formula_jq/fields/lookback/minlen/func/func_name/needs_helper) 或
@@ -404,6 +511,25 @@ def prepare_factor(name, formula, meaning="", local_note="", lookback=None):
     lb = lookback or infer_lookback(f)
     wins = [int(x) for x in re.findall(r"rolling\((\d+)", f)] or [0]
     minlen = min(int(lb), max(30, max(wins) + 10))
+    # ── P-20260917-026: 周频语义 → lookback 由「周数」换算为「日频行数」 ──
+    #   原 lb 是**周数语义**窗口需求 (infer_lookback 只看字面窗口值);
+    #   周频宽表由策略内 daily→W-SUN resample 得到 ⇒ 需 lb*5 日频行数。
+    #   上限 520 (JQ get_price 行数/周 预算软约束, 见 infer_univ_cap),
+    #   下限 60 (resample 后至少要求 12 周以上才可能出非 NaN)。
+    lb_weekly = infer_lookback_weekly(f) if weekly_semantics else None
+    if weekly_semantics:
+        _need = int(lb_weekly) * 5 + 25
+        if _need > _JQ_WEEKLY_LB_CAP:
+            # 🔴 拒绝而非截断: 截断会让周频宽表周数不足 ⇒ 因子末行全 NaN
+            #    ⇒ valid=0 ⇒ 组合零收益, 且全程无报错 (静默事故)。
+            return {"ok": False, "reason": (
+                "周频语义 lookback 超 JQ 预算: 需 %d 日频行 "
+                "(周窗口链 %d 周 × 5 + 25) > 上限 %d ⇒ 拒绝生成。"
+                "可选: 缩短窗口 / 显式传 lookback / "
+                "FUXI_JQ_WEEKLY_SEMANTICS=off 并手工做窗口 x5 换算。"
+                % (_need, lb_weekly, _JQ_WEEKLY_LB_CAP))}
+        lb = int(min(_JQ_WEEKLY_LB_CAP, max(60, _need)))
+        minlen = max(30, min(int(lb_weekly), max(wins) + 10))
     n_fields = 1 + len([x for x in jq_fields if x != "close"])
     # P-20260814-003: 长窗口语义检测
     window_warnings = detect_window_semantics(f)
@@ -419,6 +545,9 @@ def prepare_factor(name, formula, meaning="", local_note="", lookback=None):
         "needs_rank_helper": needs_rank_helper,
         "univ_cap": infer_univ_cap(int(lb), n_fields),
         "window_warnings": window_warnings,
+        # P-20260917-026: 周频语义审计字段
+        "weekly_semantics": bool(weekly_semantics),
+        "lookback_weekly": lb_weekly,
     }
 
 
@@ -443,10 +572,18 @@ def _smoke_last_row_valid(formula_jq, lookback):
                              columns=list("abcd"))
         volume = pd.DataFrame(np.random.rand(lb, 4) * 1e6, index=idx,
                               columns=list("abcd"))
+        # P-20260905: 旧版 open/high/low 全部用 close 填充 → high==low==close
+        # → hl_ratio 恒为 1 → rolling std=0 → 分母 clip 后仍爆炸 → cov 产 NaN
+        # → smoke 假阳性 (gp_evo_002 实证: 真实分布下公式 300/300 finite)。
+        # 改为与真实 OHLC 结构一致的随机数据 (high≥max(open,close), low≤min(open,close))。
+        _rnd = np.random.rand
+        open_df = close * (1 + _rnd(lb, 4) * 0.02 - 0.01)
+        high_df = np.maximum(open_df, close) * (1 + _rnd(lb, 4) * 0.01)
+        low_df = np.minimum(open_df, close) * (1 - _rnd(lb, 4) * 0.01)
         L = {
-            "close_p": close, "volume_p": volume, "open_p": close,
-            "high_p": close, "low_p": close, "amount_p": volume,
-            "close": close, "open": close, "high": close, "low": close,
+            "close_p": close, "volume_p": volume, "open_p": open_df,
+            "high_p": high_df, "low_p": low_df, "amount_p": volume,
+            "close": close, "open": open_df, "high": high_df, "low": low_df,
             "volume": volume, "amount": volume,
             "returns": close.pct_change(),
         }
@@ -489,15 +626,44 @@ def _smoke_fix_lookback(meta):
 
 
 def generate_standalone(name, formula, meaning="", local_note="",
-                        lookback=None, out_dir=None, window_freq="daily"):
+                        lookback=None, out_dir=None, window_freq="daily",
+                        s5_passed=None, weekly_semantics=None):
     """生成 JQ 单因子回测文件. Returns (out_path, meta) 或 (None, {"reason": ...}).
 
     window_freq: 原始验证频率 ("daily"/"weekly"), P-20260814-003.
     凡公式含 rolling/ewm/shift 窗口 >= 60 的因子:
       - 打印 [WINDOW-SEMANTIC-WARNING] 到 stdout (ralph_loop 日志可见)
       - 在生成代码头部注释注明原始验证频率与窗口换算建议 (防止周频→日频语义错位)
+
+    s5_passed (v0.7.23 P0-f): 候选的真实 S5 状态。
+      - ``True``  → 文件名 ``jq_s5_pass_*`` (与历史一致)
+      - ``False`` → 文件名 ``jq_s5_fail_*`` + 注释头显式标注 "⚠️ S5未通过"
+      - ``None``  → 未知, 保持历史前缀 ``jq_s5_pass_*`` (向后兼容)
+      🔴 背景: codegen 的入队条件是 ``eligible_for_jq`` (默认 4/5 阶段), 而
+      ``FUXI_ELIGIBLE_REQUIRE_S5=off`` 时它**不等价于 S5 通过** ⇒ 实测出现
+      ``jq_s5_pass_*.py`` 的注释头自写 ``S5: grade=B calmar=0.48`` 而 docstring
+      写 "(S5 通过因子)" 的自相矛盾产物。本参数让"文件名/注释"与真实状态一致,
+      不改变任何入队条件 (是否收紧见 FUXI_ELIGIBLE_REQUIRE_S5)。
     """
-    meta = prepare_factor(name, formula, meaning, local_note, lookback)
+    _prefix = ("jq_s5_fail_" if s5_passed is False else "jq_s5_pass_")
+    if s5_passed is False:
+        _flag = "⚠️ S5未通过 (eligible_for_jq 触发, 未过联合过滤)"
+        local_note = f"{_flag} | {local_note}" if local_note else _flag
+        if not meaning:
+            meaning = "(⚠️ S5未通过因子, eligible_for_jq 触发, 自动生成)"
+    # ── P-20260917-026: 周频语义模式解析 ─────────────────────────────
+    # 根因: window_freq 由调用方传入, 而 run_v4_pipeline 未把候选的
+    #   natural_freq 接进来 ⇒ weekly-native 因子被按 "daily" 生成, 文件头
+    #   「原始验证频率: daily」是**假话**, 且窗口语义实际错位 5x。
+    # 现: ① 调用方可显式传 weekly_semantics; ② 未传则由 window_freq 推导;
+    #     ③ 由 FUXI_JQ_WEEKLY_SEMANTICS 统一开关 (auto 默认 / off 回退日频)。
+    _ws_env = (os.environ.get("FUXI_JQ_WEEKLY_SEMANTICS", "auto")
+               or "auto").strip().lower()
+    if weekly_semantics is None:
+        weekly_semantics = (_ws_env != "off"
+                            and str(window_freq or "").strip().lower() == "weekly")
+    meta = prepare_factor(name, formula, meaning, local_note, lookback,
+                          weekly_semantics=bool(weekly_semantics))
     if not meta["ok"]:
         return None, meta
 
@@ -512,7 +678,12 @@ def generate_standalone(name, formula, meaning="", local_note="",
     # P-20260814-003: 长窗口语义校验输出 (周频→日频错位防护)
     ww = meta.get("window_warnings", [])
     window_note = ""
-    if ww:
+    if ww and meta.get("weekly_semantics"):
+        # P-20260917-026: 语义已由「周频宽表求值」解决 ⇒ 不再提示 x5 换算
+        # (旧文案会误导使用者以为还要手工改窗)
+        meta["window_warning"] = None
+        window_note = ""
+    elif ww:
         detail = ", ".join("%s(%s)" % (k, int(w) if float(w) == int(w) else w)
                            for k, w, _ in ww)
         if window_freq == "weekly":
@@ -534,12 +705,47 @@ def generate_standalone(name, formula, meaning="", local_note="",
     else:
         meta["window_warning"] = None
 
+    # ── P-20260917-026: 周频语义模式 → 语义已解决, 覆盖「x5 换算」的劝改文案 ──
+    if meta.get("weekly_semantics"):
+        _lb_w = meta.get("lookback_weekly") or 0
+        _lb_d = meta.get("lookback") or 0
+        _lb_ref = infer_lookback(meta["formula"])
+        _ratio = (_lb_d / float(_lb_ref)) if _lb_ref else 0.0
+        window_note = (
+            "# [周频语义 P-20260917-026] 原始验证频率: weekly ⇒ 本回测在**周频宽表**\n"
+            "#   上求值 (策略内 daily→W-SUN resample, 聚合与 weekly_panel 一致),\n"
+            "#   公式窗口保持周语义 (rolling(60)=60 周), 不做 x5 改写。\n"
+            "#   lookback=%d 日频行 ≈ %d 周 (日频模式参考值 %d) ⇒ get_price 行数 ~%.1fx,\n"
+            "#   单轮回测耗时上升属预期 (JQ 5.5万行/周 预算软约束)。\n"
+            "#   回退日频语义: FUXI_JQ_WEEKLY_SEMANTICS=off 重新生成。\n"
+            % (_lb_d, _lb_w, _lb_ref, _ratio)
+        )
+        print("[WEEKLY-SEMANTICS] %s: 周频宽表求值, lookback=%d 日 ≈ %d 周"
+              % (name, _lb_d, _lb_w))
+        meta["window_semantics"] = "weekly_panel"
+    else:
+        meta["window_semantics"] = "daily"
+
     # 复用 gen_jq_s5_standalone 的公共模板 (已在 JQ 验证)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from gen_jq_s5_standalone import TEMPLATE
 
+    # ── v0.7.23 P0-f: 模板标题/启动日志的 S5 状态如实化 ──────────────
+    # 模板里这两处是**字面量**(非占位符), 若不改会与上面的 local_note/meaning
+    # 自相矛盾 (实测: 文件头顶行写 "(S5 通过因子)" 而下一行写 "⚠️ S5未通过")。
+    # 用字面量替换而非新增占位符 ⇒ 其余两个生产者 (gen_jq_s5_standalone /
+    # pass_to_jq_bridge) 完全不受影响 (默认 = 历史文案)。
+    code_prefix_swap = None
+    if s5_passed is False:
+        _T_OLD = "@FNAME@ 单因子独立回测 (S5 通过因子)"
+        _T_NEW = "@FNAME@ 单因子独立回测 (⚠️ S5 未通过 — eligible_for_jq 触发)"
+        _L_OLD = 'log.info("@FNAME@ 单因子 (S5通过, 滞后IC) 启动")'
+        _L_NEW = 'log.info("@FNAME@ 单因子 (⚠️ S5未通过, eligible_for_jq 触发, 滞后IC) 启动")'
+        code_prefix_swap = ((_T_OLD, _T_NEW), (_L_OLD, _L_NEW))
+
     func_name, func_body = _build_generic_func(
-        name, meta["formula_jq"], meaning or "", meta["minlen"], meta["fields"]
+        name, meta["formula_jq"], meaning or "", meta["minlen"], meta["fields"],
+        weekly_semantics=bool(meta.get("weekly_semantics")),
     )
     helper = _RANK_HELPER if meta["needs_helper"] else ""
     if meta["needs_rank_helper"]:
@@ -552,6 +758,9 @@ def generate_standalone(name, formula, meaning="", local_note="",
     )
 
     code = TEMPLATE
+    if code_prefix_swap:
+        for _old, _new in code_prefix_swap:
+            code = code.replace(_old, _new)
     code = code.replace("@FNAME@", name)
     code = code.replace("@FNAME_SAFE@", func_name)
     code = code.replace("@MEANING@", meaning or "(S5 通过因子, 自动生成)")
@@ -581,7 +790,8 @@ def generate_standalone(name, formula, meaning="", local_note="",
     code = code.replace("@EXTRA_LOAD@", extra)
 
     out_dir = out_dir or OUT_DIR
-    out_path = os.path.normpath(os.path.join(out_dir, f"jq_s5_pass_{name}_standalone.py"))
+    # v0.7.23 P0-f: 前缀如实反映 S5 状态 (pass/fail), 不再一律写 s5_pass
+    out_path = os.path.normpath(os.path.join(out_dir, f"{_prefix}{name}_standalone.py"))
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(code)
     # 语法校验
@@ -600,11 +810,17 @@ if __name__ == "__main__":
     ap.add_argument("--note", default="")
     ap.add_argument("--lookback", type=int, default=None)
     ap.add_argument("--window-freq", choices=["daily", "weekly"], default="daily",
-                    help="原始验证频率 (P-003: 长窗口语义校验)")
+                    help="原始验证频率 (P-003: 长窗口语义校验) "
+                         "weekly ⇒ 默认启用周频宽表求值 (P-20260917-026)")
+    ap.add_argument("--s5-passed", dest="s5_passed", default="unknown",
+                    choices=["pass", "fail", "unknown"],
+                    help="P-20260915 P0-f: 真实 S5 状态 → 决定文件名前缀 "
+                         "(pass→jq_s5_pass_ / fail→jq_s5_fail_ / unknown→历史前缀)")
     args = ap.parse_args()
+    _s5_flag = {"pass": True, "fail": False, "unknown": None}[args.s5_passed]
     out_path, meta = generate_standalone(
         args.name, args.formula, args.meaning, args.note, args.lookback,
-        window_freq=args.window_freq
+        window_freq=args.window_freq, s5_passed=_s5_flag
     )
     if out_path:
         print("[OK] %s (lookback=%d fields=%s)" % (

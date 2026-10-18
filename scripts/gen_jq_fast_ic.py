@@ -17,7 +17,7 @@ JQ 单因子 IC 快验批量生成器 (v1.0, 2026-08-31)
   python scripts/gen_jq_fast_ic.py --generate --include weekly_backfill_calib_forge__36fe6513
   # 2. 用户把生成的 jq_fast_ic_batch_*.py 上传聚宽跑回测, 复制日志到本地文件
   # 3. 回灌结果 (解析 [FAST_IC] 行 → 队列 fast_ic_result 字段)
-  python scripts/gen_jq_fast_ic.py --ingest <日志文件>
+  python scripts/gen_jq_fast_ic.py --ingest E:/log/xxx_fast_ic.txt
 
 依赖: 复用 scripts/gen_jq_generic.py 的公式翻译/字段分析/lookback 推断/smoke 防线
 """

@@ -1,14 +1,12 @@
 """Stage 1 Factor Proposal Generator - 2026-07-21"""
 import json, re
-from pathlib import Path
-_PROJ = Path(__file__).resolve().parent.parent
 
 # ============ DEDUP: load all existing factor names ============
 all_existing = set()
 
 # 1. tested_factors.json
 try:
-    with open(_PROJ / 'data' / 'tested_factors.json') as f:
+    with open('e:/quant/data/tested_factors.json') as f:
         tested = json.load(f)
     names = tested.get('names', tested) if isinstance(tested, dict) else tested
     if isinstance(names, list):
@@ -21,7 +19,7 @@ except:
 # 2. passed_factor_pool.csv
 try:
     import pandas as pd
-    df = pd.read_csv(_PROJ / 'data' / 'passed_factor_pool.csv')
+    df = pd.read_csv('e:/quant/data/passed_factor_pool.csv')
     if 'name' in df.columns:
         all_existing.update(df['name'].values)
 except:
@@ -29,7 +27,7 @@ except:
 
 # 3. factors/__init__.py
 try:
-    with open(_PROJ / 'factor_alchemy' / 'factors' / '__init__.py') as f:
+    with open('e:/quant/research/factor_alchemy/factors/__init__.py') as f:
         content = f.read()
     refs = re.findall(r'(?:"|\')([a-z][a-z0-9_]{4,})(?:"|\')\s*:', content)
     all_existing.update(refs)
@@ -37,12 +35,18 @@ except:
     pass
 
 # 4. existing proposals
+# 2026-09-25 修复: 原写作 `p['name']`, 但因子池 2568 条**全部**只有键
+# `factor_name`（含键 `name` 的 0 条）⇒ 抛 KeyError 被下面的裸 except 吞掉,
+# 导致 2568 个已有因子名一条也没进 all_existing（去重静默失效, 属静默降级）。
 try:
-    with open(_PROJ / 'data' / 'stage1_factor_proposals.json') as f:
+    with open('e:/quant/data/stage1_factor_proposals.json', encoding='utf-8') as f:
         props = json.load(f)
-    all_existing.update(p['name'] for p in props.get('proposals', []))
-except:
-    pass
+    _recs = props.get('proposals', []) if isinstance(props, dict) else props
+    all_existing.update(
+        n for n in (str(p.get('name') or p.get('factor_name') or '').strip() for p in _recs) if n
+    )
+except Exception as _e:
+    print(f"[WARN] 提案池去重名单加载失败（不再静默）: {type(_e).__name__}: {_e}")
 
 print(f"Total existing unique names: {len(all_existing)}")
 
@@ -252,6 +256,6 @@ print(f"Total proposals after merge: {len(merged['proposals'])}")
 print("Saved to data/stage1_factor_proposals.json")
 
 # Re-validate
-with open(_PROJ / 'data' / 'stage1_factor_proposals.json', encoding='utf-8') as f:
+with open('e:/quant/data/stage1_factor_proposals.json', encoding='utf-8') as f:
     json.load(f)
 print("JSON validation PASSED")

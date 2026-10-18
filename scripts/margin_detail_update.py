@@ -22,7 +22,10 @@ import pandas as pd
 RAW = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "raw")
 MARGIN_CSV = os.path.join(RAW, "margin_detail.csv")
 
-FIELDS = ["trade_date", "ts_code", "rzye", "rqye", "rzmre", "rqyl", "rqchl"]
+FIELDS = ["trade_date", "ts_code", "rzye", "rqye", "rzmre", "rqyl", "rqchl",
+          # P-20260911-margin (2026-09-11): Tushare 2026-08 起 margin_detail 返回 10 列,
+          # 新增三列此前被 smart_append 丢弃 → 两融余额/偿还维度缺口。现纳入采集。
+          "rzche", "rqmcl", "rzrqye"]
 
 
 def get_pro():

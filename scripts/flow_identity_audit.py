@@ -33,8 +33,8 @@ FinScope 每日因子 (2026-08) 警告: RankCorr(超大单20d净流入, 小单20
 不改 library_orthogonality_state.json, 不降权, 不删除。
 
 用法:
-    cd <项目根目录> && python scripts/flow_identity_audit.py            # 全族 51 因子
-    cd <项目根目录> && python scripts/flow_identity_audit.py --top-n 8  # 只看 IC 正 Top-N
+    cd e:/quant && python scripts/flow_identity_audit.py            # 全族 51 因子
+    cd e:/quant && python scripts/flow_identity_audit.py --top-n 8  # 只看 IC 正 Top-N
 """
 
 import argparse

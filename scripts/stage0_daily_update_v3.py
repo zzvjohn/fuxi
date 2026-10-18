@@ -14,8 +14,12 @@ v3 修复:
   python -u scripts/stage0_daily_update_v3.py --rebuild-meta  # 重建元数据缓存
 """
 import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, 'e:/quant')
+from pathlib import Path as _FuxiPath
+import sys as _FuxiSys
+_FuxiSys.path.insert(0, str(_FuxiPath(__file__).resolve().parents[1]))
+from fuxi_v1.legacy_writers import legacy_cli_guard as _FuxiGuard
+_fuxi_guard = _FuxiGuard(__file__)
 from credentials import get_tushare_api
 import pandas as pd
 import numpy as np
@@ -29,7 +33,7 @@ from datetime import datetime, timedelta
 # ============================================================
 # 配置
 # ============================================================
-BASE = str(Path(__file__).resolve().parent.parent / 'data' / 'raw')
+BASE = 'e:/quant/data/raw'
 META_PATH = os.path.join(BASE, '.meta.json')
 # 动态取当天日期（修复原硬编码 20260705 导致无法拉取新交易日的 bug）
 TODAY = datetime.now().strftime('%Y%m%d')
@@ -195,29 +199,25 @@ def smart_append_csv(path, df_new, dedup_keys):
     if len(new_only) == 0:
         return 0, old_count, None
 
-    # v0.9.1 (2026-08-19): 追加前列对齐 — 防止 API 返回字段漂移污染存量文件
-    # 事故实证: margin_detail 202608 增量 Tushare 返回 10 列 (多 rzche/rqmcl/rzrqye),
-    # 直接 append 到 7 列文件尾部 → 13290 行字段错位, 后续 read_csv 全表加载失败。
-    if old_count > 0:
-        try:
-            with open(path, 'r', encoding='utf-8-sig') as f:
-                header_line = f.readline().strip()
-            existing_cols = [c.strip() for c in header_line.split(',')]
-            missing = [c for c in existing_cols if c not in new_only.columns]
-            if missing:
-                print(f"    ⚠️ [smart_append] 新数据缺列 {missing}, 填 NaN 追加", flush=True)
-                for c in missing:
-                    new_only[c] = pd.NA
-            extra = [c for c in new_only.columns if c not in existing_cols]
-            if extra:
-                print(f"    ⚠️ [smart_append] 新数据多列 {extra}, 已丢弃 (按存量列序对齐)", flush=True)
-                new_only = new_only[existing_cols]
-        except Exception as _e:
-            print(f"    ⚠️ [smart_append] 列对齐检查失败(继续原样追加): {_e}", flush=True)
+    # 2026-09-30: schema failures must never fall through to positional append.
+    # Vendor column-set changes need a separately versioned file/migration, not
+    # an in-place rewrite of historical raw evidence during an ordinary update.
+    has_header = os.path.exists(path) and os.path.getsize(path) > 0
+    newline = '\n'
+    if has_header:
+        with open(path, 'rb') as raw_header:
+            newline = '\r\n' if b'\r\n' in raw_header.read(65536) else '\n'
+        existing_cols = list(pd.read_csv(path, nrows=0, encoding='utf-8-sig').columns)
+        missing = sorted(set(existing_cols) - set(new_only.columns))
+        extra = sorted(set(new_only.columns) - set(existing_cols))
+        if missing or extra or len(existing_cols) != len(set(existing_cols)):
+            raise ValueError('CSV schema changed; preserve raw file and stage a versioned migration: '
+                             f'missing={missing}, extra={extra}')
+        new_only = new_only.loc[:, existing_cols]
 
     # 追加
-    write_header = (old_count == 0)
-    new_only.to_csv(path, mode='a', index=False, header=write_header, encoding='utf-8-sig')
+    write_header = not has_header
+    new_only.to_csv(path, mode='a', index=False, header=write_header, encoding='utf-8-sig', lineterminator=newline)
     
     new_count = len(new_only)
     total = get_line_count(path)
@@ -427,6 +427,49 @@ old_max, old_cnt = get_table_meta('fina_indicator', 'data/raw/fina_indicator.csv
 print(f"  存量: {old_cnt} 行 | 最新 ann_date: {old_max}", flush=True)
 print(f"  ⚠️ API 要求 ts_code 逐股，Stage 0 不批量采集", flush=True)
 results['fina_indicator'] = f"⚠️ 跳过 / {old_cnt}行 / {old_max}"
+
+# ============================================================
+# Phase 1.7: 指数日线 + 申万行业 + 涨跌停价 (M16, 2026-09-26)
+# ============================================================
+# 背景: 000985/000905/sw_daily 此前不在任何日更链 → 冻结 (指数止 2026-09-09,
+#   sw 止 2026-04-24), 把 S5 FUXI_S5_DATE_CEIL=auto 的裁决窗钉死在指数末端
+#   (实测落后价格末端 11 个交易日); stk_limit 止 2026-08-03, 且历史段混用
+#   短横线日期 (存量已由 scripts/fix_stk_limit_date_format_20260926.py 一次性归一)。
+# 现纳入日更: 指数与 sw 走独立采集模块 (scripts/collect_index_daily.py /
+#   scripts/collect_sw_daily.py, 各自幂等、只追加、格式契约与存量逐列一致);
+#   stk_limit 走本文件通用逐日增量。失败不阻塞, 与其它表一致。
+
+print(f"\n[index_daily] 指数日线 (000985/000905/000300)", flush=True)
+try:
+    _scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    if _scripts_dir not in sys.path:
+        sys.path.insert(0, _scripts_dir)
+    from collect_index_daily import update_indices
+    idx_res = update_indices(pro, verbose=True)
+    results['index_daily'] = '✅ ' + '; '.join(
+        f"{r['name'].replace('index_', '')}:+{r['added']}/{r['last']}" for r in idx_res)
+except Exception as e:
+    results['index_daily'] = f"❌ {str(e)[:80]}"
+    print(f"  ❌ {e}", flush=True)
+
+print(f"\n[sw_daily] 申万行业日线", flush=True)
+try:
+    from collect_sw_daily import update_sw_daily
+    sw_res = update_sw_daily(pro, verbose=True)
+    results['sw_daily'] = f"✅ +{sw_res['added']} / {sw_res['last']}"
+except Exception as e:
+    results['sw_daily'] = f"❌ {str(e)[:80]}"
+    print(f"  ❌ {e}", flush=True)
+
+print(f"\n[stk_limit] 涨跌停价", flush=True)
+try:
+    update_daily_by_trade_date(
+        'stk_limit', 'data/raw/stk_limit.csv',
+        lambda trade_date: pro.stk_limit(trade_date=trade_date),
+        ['ts_code', 'trade_date'], '涨跌停', max_missing_days=10)
+except Exception as e:
+    results['stk_limit'] = f"❌ {str(e)[:80]}"
+    print(f"  ❌ {e}", flush=True)
 
 # ============================================================
 # Phase 2: report_rc (仅当 --report-rc 启用)

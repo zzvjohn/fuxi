@@ -62,12 +62,16 @@ def save(data):
 
 
 def _atomic_write(data):
-    tmp = PATH + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, PATH)
-    with open(PATH, 'r', encoding='utf-8') as f:   # 写后读回校验
-        json.load(f)
+    # 2026-09-25：改为委托 scripts/json_store.py，**行尾保真**。
+    # 旧实现 open(tmp,'w',encoding='utf-8') 在 Windows 文本模式下把 '\n' 静默改写成
+    # '\r\n'，等价于每次写盘都做一次「全局行尾转换」（违反 AGENTS.md 行尾纪律）。
+    # 因子池当前恰为 CRLF 故未暴露；但同类写法已实际把账本 LF 翻成 CRLF（P-20260925-011）。
+    # json_store.atomic_write 会先实测既有行尾再落盘，并对写后字节做回读校验。
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import json_store  # noqa: E402
+    json_store.atomic_write(PATH, data)
 
 
 def load_and_modify(modifier):

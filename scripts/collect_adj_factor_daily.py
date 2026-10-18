@@ -24,7 +24,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from credentials import get_tushare_api
 
-RAW = Path(__file__).resolve().parent.parent / 'data' / 'raw'
+RAW = Path("e:/quant/data/raw")
 OUT = RAW / "adj_factor_daily.csv"
 STATE = RAW / "adj_factor_daily_state.txt"   # 断点: 每行一个已完成的 trade_date
 
@@ -116,4 +116,9 @@ def main():
 
 
 if __name__ == "__main__":
+    from pathlib import Path as _FuxiPath
+    import sys as _FuxiSys
+    _FuxiSys.path.insert(0, str(_FuxiPath(__file__).resolve().parents[1]))
+    from fuxi_v1.legacy_writers import legacy_cli_guard as _FuxiGuard
+    _fuxi_guard = _FuxiGuard(__file__)
     main()

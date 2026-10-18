@@ -208,6 +208,12 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='预览模式，不写入')
     parser.add_argument('--factor', type=str, help='仅注入指定因子名')
     args = parser.parse_args()
+    from pathlib import Path as _FuxiPath
+    import sys as _FuxiSys
+    _FuxiSys.path.insert(0, str(_FuxiPath(__file__).resolve().parents[1]))
+    from fuxi_v1.legacy_writers import legacy_cli_guard as _FuxiGuard
+    _fuxi_guard = _FuxiGuard(__file__, read_only=args.dry_run)
+
 
     # 加载已有数据
     pool_names = load_existing_pool_names()

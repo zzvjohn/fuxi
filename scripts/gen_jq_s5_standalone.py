@@ -19,6 +19,36 @@ import re
 import sys
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "research", "factor_alchemy")
+TIER_DIR = os.path.normpath(OUT_DIR)      # captured separately so patching OUT_DIR in a test
+                                          # cannot break where the tier module is imported from
+
+
+def _tier_gate(name):
+    """两层分层的晋级闸门（P2 落地）。
+
+    research/factor_alchemy/feature_tier.py 是「研究特征库 + 策略晋级库」的唯一登记处。
+    它唯一的能力是把研究特征挡在晋级之外（只删不加），永远不会授予晋级资格。
+    未登记的名字不受影响，因此库为空时本函数是 no-op（= legacy 行为）。
+
+    导入失败或登记库损坏时**拒绝**（fail-closed），不静默放行：一个无法判定层级的
+    名字不应该悄悄走到 JQ 生成这一步。
+    """
+    if TIER_DIR not in sys.path:
+        sys.path.insert(0, TIER_DIR)
+    try:
+        import feature_tier as _ft
+    except Exception as exc:                                   # noqa: BLE001
+        raise RuntimeError(
+            'tier module unimportable (%s): refusing to generate JQ code for %r because its '
+            'tier cannot be decided' % (exc, name)) from exc
+    try:
+        _ft.assert_promotable(name)
+    except _ft.NotPromotableError:
+        raise                       # the refusal itself must not be rewritten
+    except Exception as exc:                                   # noqa: BLE001
+        raise RuntimeError(
+            'tier registry unreadable (%s): refusing to generate JQ code for %r because its '
+            'tier cannot be decided' % (exc, name)) from exc
 
 # ════════════════════════════════════════════════════════════
 # 因子注册表: 每项含 (JQ 函数体, 因子中文含义, lookback, local 指标注释)
@@ -320,6 +350,7 @@ def initialize(context):
     set_option("use_real_price", True)
     set_option("avoid_future_data", True)
     log.set_level("order", "error")
+    log.set_level("system", "error")  # P-20260902-016: 抑制 order 函数内部仓位查询的 WARNING ("在 positions 中不存在" 刷屏)
     set_order_cost(OrderCost(open_tax=0, close_tax=0.001,
                               open_commission=0.0001, close_commission=0.0001),
                    type="stock")
@@ -581,6 +612,15 @@ def rebalance(context):
             ref_px = d.day_open if (d.day_open and d.day_open > 0) else d.last_price
             if ref_px <= 0 or w / ref_px < 100: # 开盘价口径判断能否买100股
                 continue
+            # P-20260901-008: 差额微调保护 — order_target_value 对已持仓股票按
+            # |target_value - current_value| 差额下单, 差额<100股时 JQ 报
+            # "开仓/平仓数量不能小于 100" (2026-09-01 9因子回测累计3.5万次失败)。
+            # 微调差额不足一手时保持现状, 消除刷屏级委托失败。
+            _pos = context.portfolio.positions.get(s)
+            if _pos is not None and getattr(_pos, "total_amount", 0) > 0:
+                _delta = int(w / ref_px) - int(_pos.total_amount)
+                if abs(_delta) < 100:
+                    continue
             order_target_value(s, w)
             ordered += 1
         except Exception:
@@ -609,6 +649,7 @@ def _fname_safe(name):
 
 
 def generate(name):
+    _tier_gate(str(name).strip())
     meta = FACTORS[name]
     from datetime import datetime
     code = TEMPLATE

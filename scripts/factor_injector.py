@@ -675,4 +675,9 @@ def main():
 
 
 if __name__ == "__main__":
+    from pathlib import Path as _FuxiPath
+    import sys as _FuxiSys
+    _FuxiSys.path.insert(0, str(_FuxiPath(__file__).resolve().parents[1]))
+    from fuxi_v1.legacy_writers import legacy_cli_guard as _FuxiGuard
+    _fuxi_guard = _FuxiGuard(__file__, read_only='--dry-run' in __import__('sys').argv)
     main()

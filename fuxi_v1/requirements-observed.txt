@@ -1,0 +1,12 @@
+# Observed, already installed dependencies for the validated Windows/Python 3.13.14 run.
+# This is a version inventory, not a hash-locked cross-platform package distribution.
+numpy==2.4.6
+pandas==3.0.3
+scikit-learn==1.6.1
+scipy==1.17.1
+lightgbm==4.7.0
+xgboost==3.2.0
+psutil==7.2.2
+pyarrow==24.0.0
+joblib==1.5.3
+threadpoolctl==3.6.0

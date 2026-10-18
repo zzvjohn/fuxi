@@ -1,26 +1,49 @@
-# 凭据 — 永不提交
+# .gitignore
+# ---- 凭据：永不提交 ----
 .env
+.env.*
+!.env.example
+.env.bt
+.gh_token
+config/secrets.local.json
+config/secrets*.json
+*.local.json
+cookies/
+credentials_local.py
 
-# 运行时数据与产物
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- 数据与运行产物（体积大 / 含账户信息，不入库）----
 data/
 output/
 outputs/
+log/
 logs/
 *.log
-*.json
-*.jsonl
-*.csv
+*.sqlite
+*.sqlite-journal
+*.npy
+*.npz
+*.bin
 *.pkl
 *.parquet
-*.feather
 
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-
-# IDE
-.idea/
+# ---- IDE ----
 .vscode/
+.idea/
+
+# ---- OS ----
+Thumbs.db
+.DS_Store
+
+# ---- WorkBuddy 内部状态（含记忆日志与团队协作数据）----
+.workbuddy/

@@ -156,15 +156,35 @@ def get_system_snapshot(report_text):
 
 
 def get_frontier(report_text):
-    """从日报 '2. 本周量化前沿' 提取 4 维度条目"""
+    """从日报 '2. 本周量化前沿' 提取 4 维度条目。
+    兼容两种格式: ①独立 '**X#. 标题（来源）**' 行 + 内容段 (2026-09-10 起, 对齐 RAG 解析器);
+    ②旧 'N. **标题**: 内容' 编号行。"""
     secs = md_sections(report_text or "")
     front = secs.get("2. 本周量化前沿", "") or secs.get("2. 量化前沿", "")
     dims = []
     for title, content in md_sub_sections(front).items():
         items = []
-        # 条目: "1. **标题**: 内容" 或 "1. 标题 — 内容"
-        for m in re.finditer(r"(\d+)\.\s*\*\*(.+?)\*\*[:\s]*(.*?)(?=\n\s*\d+\.\s|\n\s*$|$)", content, re.S):
-            items.append({"title": m.group(2).strip(), "body": m.group(3).strip().replace("\n", " ")})
+        # ① 新格式: 独立 **...** 行, 后续行是内容, 直到下一个 ** 行
+        lines = content.split("\n")
+        i = 0
+        while i < len(lines):
+            s = lines[i].strip()
+            m = re.match(r"^\*\*(.+?)\*\*$", s)
+            if m:
+                body = []
+                i += 1
+                while i < len(lines) and not re.match(r"^\*\*.+\*\*$", lines[i].strip()):
+                    if lines[i].strip():
+                        body.append(lines[i].strip())
+                    i += 1
+                head = re.sub(r"^[A-E]\d+\.\s*", "", m.group(1)).strip()
+                items.append({"title": head, "body": " ".join(body)})
+            else:
+                i += 1
+        if not items:
+            # ② 旧格式: "N. **标题**: 内容" 或 "N. 标题 — 内容"
+            for m in re.finditer(r"(\d+)\.\s*\*\*(.+?)\*\*[:\s]*(.*?)(?=\n\s*\d+\.\s|\n\s*$|$)", content, re.S):
+                items.append({"title": m.group(2).strip(), "body": m.group(3).strip().replace("\n", " ")})
         if not items:
             for m in re.finditer(r"(\d+)\.\s*([^:：\n]+)[:：\s]+(.*?)(?=\n\s*\d+\.\s|$)", content, re.S):
                 items.append({"title": m.group(2).strip(), "body": m.group(3).strip().replace("\n", " ")})
@@ -346,6 +366,8 @@ def get_ralph_latest():
         "candidates": r.get("total_candidates", 0),
         "s1": ev.get("stage1_passed", "?"),
         "s5": ev.get("stage5_passed", "?"),
+        # ── W5 (2026-09-12): S5 口径徽标 + 不可比告警 (诊断, 不影响裁决) ──
+        "s5_caliber": (r.get("s5_caliber_summary") or {}),
         "eligible": r.get("n_jq_candidates", 0),
         "jq_names": r.get("jq_candidates", []),
     }
@@ -498,10 +520,28 @@ def render_system(mem, mab, lib, traj, decay, ralph, red_sea, snapshot, market_c
     eng = snapshot.get("engine_mix", "—")
     ralph_html = ""
     if ralph:
+        # ── W5 (2026-09-12): S5 口径徽标 + 窗口不可比告警 ──
+        _cal = ralph.get("s5_caliber") or {}
+        _mode = _cal.get("calmar_mode") or ""
+        _thr = _cal.get("calmar_threshold_effective")
+        _w25 = _cal.get("window_days_2025") or 0
+        _w26 = _cal.get("window_days_2026") or 0
+        _matched = _cal.get("window_matched")
+        _caliber_line = ""
+        if _mode:
+            _badge = {"vol_scaled": f"S5^{_thr}", "legacy": f"S5^{_thr}(legacy)",
+                      "common_window": f"S5^{_thr}(cw)"}.get(_mode, f"S5({_mode})")
+            _warn = ""
+            if _matched is False:
+                _warn = (f' <b style="color:#c0392b">⚠️ 窗口不可比'
+                         f'({_w25}d vs {_w26}d)</b>')
+            _caliber_line = (f"<br><small>口径 {esc(_mode)} · 阈值 {esc(str(_thr))} · "
+                             f"窗口 {_w25}d/{_w26}d · matched={esc(str(_matched))}"
+                             f"{_warn} <i>(诊断, 不影响裁决)</i></small>")
         ralph_html = f"""
         <div class="sys-item"><span class="sys-k">Ralph Loop</span>
           <span class="sys-v">最近 {esc(ralph['ts'])} · {esc(ralph['source'])} · {ralph['elapsed']}s<br>
-          <small>候选 {ralph['candidates']} · S1通过 {ralph['s1']} · S5通过 {ralph['s5']} · JQ候选 {ralph['eligible']}</small></span></div>"""
+          <small>候选 {ralph['candidates']} · S1通过 {ralph['s1']} · S5通过 {ralph['s5']} · JQ候选 {ralph['eligible']}</small>{_caliber_line}</span></div>"""
     decay_html = ""
     if decay["alerts"]:
         alerts_html = "".join(
@@ -753,7 +793,7 @@ def build_html():
         <div class="sys-item"><span class="sys-k">Stage 1 研究提案</span><span class="sys-v">每日 09:30 · 日报 + 提案</span></div>
         <div class="sys-item"><span class="sys-k">Stage 2 因子实验</span><span class="sys-v">每日 13:00 · S1-S5 验证</span></div>
         <div class="sys-item"><span class="sys-k">Stage 3 自进化</span><span class="sys-v">每日 15:00 · Ralph Loop</span></div>
-        <div class="sys-item"><span class="sys-k">RAG 入库</span><span class="sys-v">日报 → 本地 RAG 索引</span></div>
+        <div class="sys-item"><span class="sys-k">RAG 入库</span><span class="sys-v">日报 → D:/RAG 索引</span></div>
         <div class="sys-item"><span class="sys-k">看板刷新</span><span class="sys-v">流水线末步自动更新</span></div>
       </div>
     </div>"""
@@ -828,4 +868,9 @@ def main():
 
 
 if __name__ == "__main__":
+    from pathlib import Path as _FuxiPath
+    import sys as _FuxiSys
+    _FuxiSys.path.insert(0, str(_FuxiPath(__file__).resolve().parents[1]))
+    from fuxi_v1.legacy_writers import legacy_cli_guard as _FuxiGuard
+    _fuxi_guard = _FuxiGuard(__file__)
     main()

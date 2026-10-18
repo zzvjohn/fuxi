@@ -15,15 +15,14 @@ P-002 三路资金分歧升级依赖: 北向个股持股明细 (沪股通SH + �
   python scripts/hk_hold_update.py --start 20170301 --end 20241231   # 全量历史
 """
 import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, 'e:/quant')
 from credentials import get_tushare_api
 import pandas as pd
 import time
 import os
 from datetime import datetime
 
-BASE = str(Path(__file__).resolve().parent.parent / 'data' / 'raw')
+BASE = 'e:/quant/data/raw'
 HK_HOLD_PATH = os.path.join(BASE, 'hk_hold.csv')
 FLUSH = lambda: sys.stdout.flush()
 

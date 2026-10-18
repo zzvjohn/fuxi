@@ -1,7 +1,34 @@
 # 更新日志 (Changelog)
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格。
-版本号 `v0.7.x` 对应内部 v0.7 双通道架构的补丁序列。
+版本号自 v2.0.0 起与产品名对齐；`v0.7.x` 段为旧伏羲的工程批次账本，两者并行记录。
+
+## [2.0.0] - 2026-10-18
+
+### Changed
+- **版本号与产品名对齐**：`fuxi_v1/__init__.py::__version__` 由 `1.0.0-rc12` 定为 **`2.0.0`**，
+  新增根目录 `VERSION` 作为唯一对外版本声明。
+- **主链路收敛到 `fuxi_v1` kernel**：数据 → 研究（L0–L3）→ 搜索 → 评估（E0–E5）→ 证据 → 出口。
+- **文档重写**：`README.md` / `README_EN.md` / `ARCHITECTURE.md` 全部按 v2.0 实况重写，
+  移除与实现不符的历史陈述。
+
+### Fixed
+- **快照抽样偏差**：`sorted(codes)[:N]` 会让 `000*.SZ` 垄断样本；改为按 `hash(salt, ts_code)`
+  抽样并断言沪深双所均有覆盖，`--legacy-code-order` 仅用于显式复现旧有偏样本。
+- **并行归并确定性**：并行候选结果按 `candidate_id`（digest 排序）归并，禁止按完成先后写入。
+- **E2 独立性门失效**：原实现把 E2 判定直接镜像 E3，相关性只记录不裁决；改为池内去冗余门
+  （高相关时做正交残差 IC，无残差 alpha 才拒绝）。
+- **因子库坍缩**：combine/refine 引入跨族配对约束，模板池由 62 扩至 76 个机制。
+
+### Added
+- `ARCHITECTURE.md`：v2.0 分层架构、模块职责、数据契约、E1 自适应门槛、性能基准。
+- `.env.example` / `VERSION` / `requirements-env-default.txt`。
+- 知识卡通道（`scripts/knowledge_card.py`，schema `fuxi.knowledge_card.1`，append-only），
+  外部知识只能经知识卡进入系统，且必须记录 `knowledge_available_at`。
+
+### Security
+- `.gitignore` 补齐 `.env.bt` / `.env.*`（保留 `.env.example`）/ `.workbuddy/` / `data/` / `output/` / `*.sqlite`。
+- 文档与示例中的凭据统一占位化（`YOUR_*` / `<DEEPSEEK_API_KEY>`）。
 
 ## [0.7.2] - 2026-09-01
 

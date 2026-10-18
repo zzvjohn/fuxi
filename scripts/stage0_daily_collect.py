@@ -62,11 +62,86 @@ def collect_moneyflow_incremental(pro, stocks, existing_file, lookback_days=5):
     print(f'  moneyflow: +{len(new_data):,} new, total {len(combined):,} rows')
 
 
+def check_moneyflow_coverage(pro, existing_file, threshold=1000, recent_days=60,
+                             auto_repair=True, max_repair=200):
+    """覆盖率自检 (P-20260916-003)
+
+    背景: 2026-09-16 实测发现 2025-08-08 ~ 2026-02-05 的 122 个交易日每日仅残留
+    2~4 行(尾部残片), 根因 = 历史回补走「长区间 + ts_code 分批」查询, 单次返回量被
+    Tushare 上限截断, 旧日期只剩尾部。日频增量路径本身安全(50 只 × 5 日 ≈ 250 行),
+    但任何一次性长区间回补都会重蹈覆辙 ⇒ 必须用「按日行数」而非「最新日期」判断完整性。
+
+    判据: 某交易日行数 < threshold(默认 1000, 远低于满市场 ~5150~5550) 即视为缺口。
+    修复: 该日改用 trade_date= 单日口径重采(实测单日 5548 行完整返回, 不截断)。
+    """
+    if not existing_file.exists():
+        print('  [覆盖自检] 文件不存在, 跳过')
+        return {}
+    cnt = pd.read_csv(existing_file, usecols=['trade_date'],
+                      dtype={'trade_date': str}).groupby('trade_date').size()
+    base = int(cnt.tail(recent_days).median()) if len(cnt) else 0
+    bad = {str(d): int(n) for d, n in cnt.items() if int(n) < threshold}
+    print(f'  [覆盖自检] 交易日 {len(cnt)} 个 | 近期中位数 {base} | 阈值 {threshold} | '
+          f'缺口日 {len(bad)} 个')
+    if not bad:
+        print('  [覆盖自检] OK 无覆盖缺口')
+        return {}
+    tail = sorted(bad.items())[-20:]
+    print('  [覆盖自检] ⚠️ 缺口日(最近20): ' + ', '.join(f'{d}:{n}' for d, n in tail))
+    if not auto_repair:
+        return bad
+
+    targets = sorted(bad)[-max_repair:]
+    print(f'  [覆盖自检] 触发按日重采 {len(targets)} 个交易日 ...')
+    fixed = []
+    for j, d in enumerate(targets, 1):
+        try:
+            nd = pro.moneyflow(trade_date=d)
+            if nd is not None and len(nd) >= threshold:
+                fixed.append(nd)
+            else:
+                print(f'    {d} 重采仅 {0 if nd is None else len(nd)} 行, 保留原状')
+        except Exception as e:
+            print(f'    {d} 重采失败: {e}')
+        time.sleep(0.35)
+        if j % 20 == 0:
+            print(f'    ... {j}/{len(targets)}')
+    if not fixed:
+        print('  [覆盖自检] 无成功重采, 数据保持原状')
+        return bad
+
+    new = pd.concat(fixed, ignore_index=True)
+    new['trade_date'] = new['trade_date'].astype(str)
+    new['ts_code'] = new['ts_code'].astype(str)
+    old = pd.read_csv(existing_file, dtype={'ts_code': str, 'trade_date': str})
+    keep = ~old['trade_date'].isin(set(new['trade_date'].unique()))
+    combined = pd.concat([old[keep], new], ignore_index=True)
+    combined.drop_duplicates(subset=['ts_code', 'trade_date'], inplace=True)
+    combined.sort_values(['ts_code', 'trade_date'], inplace=True)
+    combined.to_csv(existing_file, index=False)
+    print(f'  [覆盖自检] 已重采修复 {len(fixed)} 日 / 新增 {len(new):,} 行 / '
+          f'总计 {len(combined):,} 行')
+    remain = {str(d): int(n) for d, n in combined.groupby('trade_date').size().items()
+              if int(n) < threshold}
+    print(f'  [覆盖自检] 修复后剩余缺口日 {len(remain)} 个')
+    return remain
+
+
 def collect_forecast_incremental(pro, existing_file, lookback_days=90):
-    """采集分析师业绩预告 (增量)"""
+    """采集分析师业绩预告 (增量)
+
+    P2-2a 修复 (2026-09-28): 原实现三处缺陷会破坏已并入的 PIT 数据
+      (1) 去重键 (ts_code, ann_date) 为弱键 —— 同一公告日对不同报告期
+          (end_date) 的多条预告会被压成一行 (并入后实测 5 行);
+      (2) sort_values 默认 quicksort 不稳定 + 未含 end_date ⇒ 行序不确定;
+      (3) to_csv 默认 LF 会把 CRLF 主表静默改写, 且默认类型推断往返
+          会改写数值字符串形态。
+    现改为: 三键去重 + kind='stable' 三键排序 + 行尾保持 + dtype=str 保真往返。
+    """
     existing = pd.DataFrame()
     if existing_file.exists():
-        existing = pd.read_csv(existing_file, dtype={'ts_code': str, 'ann_date': str})
+        # 全字符读取: 避免类型推断往返改写数值形态 (字节保真)
+        existing = pd.read_csv(existing_file, dtype=str, keep_default_na=False)
         last_date = existing['ann_date'].max()
         start_date = (datetime.strptime(str(last_date), '%Y%m%d') - timedelta(days=lookback_days)).strftime('%Y%m%d')
         print(f'  forecast: 增量 {start_date} ~ today (已有 {len(existing):,} rows)')
@@ -93,17 +168,27 @@ def collect_forecast_incremental(pro, existing_file, lookback_days=90):
         if not all_new:
             print('  forecast: 无新数据')
             return
+        _K3 = ['ts_code', 'ann_date', 'end_date']
         new_data = pd.concat(all_new, ignore_index=True)
-        new_data.drop_duplicates(subset=['ts_code', 'ann_date'], inplace=True)
+        new_data.drop_duplicates(subset=_K3, inplace=True)
         
         if not existing.empty:
             combined = pd.concat([existing, new_data], ignore_index=True)
-            combined.drop_duplicates(subset=['ts_code', 'ann_date'], inplace=True)
+            combined.drop_duplicates(subset=_K3, inplace=True)
         else:
             combined = new_data
         
-        combined.sort_values(['ts_code', 'ann_date'], inplace=True)
-        combined.to_csv(existing_file, index=False)
+        combined.sort_values(_K3, inplace=True, kind='stable')
+        # 行尾保持 (P2-2a): 既有文件 CRLF 时不得改写为 LF
+        nl = '\n'
+        try:
+            with open(existing_file, 'rb') as _f:
+                if b'\r\n' in _f.read(65536):
+                    nl = '\r\n'
+        except Exception:
+            pass
+        with open(existing_file, 'w', encoding='utf-8', newline='') as _f:
+            combined.to_csv(_f, index=False, lineterminator=nl)
         print(f'  forecast: +{len(new_data):,} new, total {len(combined):,} rows')
     except Exception as e:
         print(f'  forecast: FAILED ({e})')
@@ -164,7 +249,11 @@ def main(full=False, moneyflow_only=False):
     if full:
         mf_path.unlink(missing_ok=True)
     collect_moneyflow_incremental(pro, stocks, mf_path)
-    
+
+    # 1b. 覆盖完整性自检 (P-20260916-003: 「最新日期」不能代表「覆盖完整」)
+    print('\n--- 1b. moneyflow 覆盖完整性自检 ---')
+    check_moneyflow_coverage(pro, mf_path)
+
     if moneyflow_only:
         print('\n' + '=' * 60)
         print('  Stage 0 [资金流增量] 完成')
@@ -193,9 +282,22 @@ def main(full=False, moneyflow_only=False):
 
 
 if __name__ == '__main__':
+    from pathlib import Path as _FuxiPath
+    import sys as _FuxiSys
+    _FuxiSys.path.insert(0, str(_FuxiPath(__file__).resolve().parents[1]))
+    from fuxi_v1.legacy_writers import legacy_cli_guard as _FuxiGuard
+    _fuxi_guard = _FuxiGuard(__file__)
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--full', action='store_true', help='全量重新采集')
     parser.add_argument('--moneyflow-only', action='store_true', help='仅采集资金流向 (17:00 增量)')
+    parser.add_argument('--check-coverage', action='store_true',
+                        help='只做 moneyflow 覆盖完整性自检 (P-20260916-003)')
+    parser.add_argument('--no-repair', action='store_true', help='自检只告警不重采')
     args = parser.parse_args()
-    main(full=args.full, moneyflow_only=args.moneyflow_only)
+    if args.check_coverage:
+        _pro = get_tushare_api()
+        check_moneyflow_coverage(_pro, DATA_DIR / 'moneyflow_daily.csv',
+                                 auto_repair=not args.no_repair)
+    else:
+        main(full=args.full, moneyflow_only=args.moneyflow_only)

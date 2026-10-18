@@ -206,6 +206,8 @@ def parse_llm_response(response: str, existing_names: set) -> list[dict]:
             'paradigm': f.get('paradigm', ''),
             'direction': f.get('direction', 'long'),
             'source_proposal': f.get('source_proposal', ''),
+            # P-20260902-005: 证伪条件透传 (AQuA 式, 缺失由 SemanticVerifier 降级)
+            'refutation_conditions': f.get('refutation_conditions', '') or '',
             'generated_at': datetime.now().isoformat(),
         })
         existing_names.add(name)
@@ -344,4 +346,9 @@ def main():
 
 
 if __name__ == '__main__':
+    from pathlib import Path as _FuxiPath
+    import sys as _FuxiSys
+    _FuxiSys.path.insert(0, str(_FuxiPath(__file__).resolve().parents[1]))
+    from fuxi_v1.legacy_writers import legacy_cli_guard as _FuxiGuard
+    _fuxi_guard = _FuxiGuard(__file__, read_only='--dry-run' in __import__('sys').argv)
     main()

@@ -22,6 +22,7 @@
 """
 
 import sys
+import os
 from pathlib import Path
 from datetime import datetime, timedelta
 import json
@@ -41,6 +42,9 @@ try:
         load_analyst_forecast_wide, load_top_list_wide, load_hk_hold_wide,
         load_industry_wide,
         load_fina_growth_wide, load_valuation_wide, load_industry_l1_wide,
+        load_feature_peer_wide, load_limit_up_wide,
+        load_lion_anchor_wide,
+        load_kuaidao_fund_wide,
     )
     _EXT_DATA_AVAILABLE = True
 except ImportError:
@@ -91,6 +95,41 @@ def check_stage1_gate(require_stage1: bool, today: datetime = None) -> bool:
 # 通过阈值 (XQuant Ch9 双重门坎，不可事后修改)
 ICIR_THRESHOLD = 0.3
 IC_PCT_THRESHOLD = 0.55
+
+# ── v0.7.29 跨截面样本量门槛 (防「稀疏截面假 PASS」) ─────────────────────────
+# 背景: ICIR = |mean(IC)/std(IC)| 的统计可信度建立在「IC 序列足够长」之上, 但原实现
+#   只对**单截面股票数**设了门槛 (len(common) < 30 → 跳过该截面), 对**跨截面数量**
+#   没有任何下限。实测 (2026-09-16, P-20260916-003/004 复评):
+#     `large_order_flow_zscore_20d` 在 NaN 诚信口径下**仅 37 个有效截面**
+#     (占面板 267 的 13.9%), 却算出 ICIR 0.401 → 会被判 PASS。
+#   ⇒ 若不先补此门槛就翻 FUXI_MF_MISSING=nan, 会放进一批「稀疏截面假 PASS」。
+# 判据锚点 (🔴 锚在实现而非命名): 用**相对覆盖率** + 绝对地板, 而非绝对 n_dates。
+#   理由: 绝对门槛会随面板长度漂移 —— tested_factors.json 实测默认 270 日面板中位
+#   n_dates 仅 155, 而 400 日复评面板为 256; 用绝对数会在面板变短时误杀、变长时放松。
+#   env FUXI_MIN_IC_DATE_RATIO / FUXI_MIN_IC_DATES_FLOOR 可覆盖; ratio=0 关闭相对维度。
+MIN_IC_DATE_RATIO = 0.5   # n_dates ≥ 面板可用截面数 × 0.5
+MIN_IC_DATES_FLOOR = 60   # 且 n_dates ≥ 60 (防极短面板下 ratio 失效)
+
+
+def _ic_dates_gate(n_dates, n_panel):
+    """跨截面样本量门槛。返回 (是否达标, 需要的最少截面数)。
+
+    达标才有资格判 PASS; 不达标时 icir 置 NaN (但保留 icir_raw 供诊断)。
+    属「单向收紧」型判据 —— 只会把 PASS 变 FAIL, 不会凭空造出 PASS。
+    """
+    try:
+        ratio = float(os.environ.get('FUXI_MIN_IC_DATE_RATIO', MIN_IC_DATE_RATIO))
+    except (TypeError, ValueError):
+        ratio = MIN_IC_DATE_RATIO
+    try:
+        floor = int(os.environ.get('FUXI_MIN_IC_DATES_FLOOR', MIN_IC_DATES_FLOOR))
+    except (TypeError, ValueError):
+        floor = MIN_IC_DATES_FLOOR
+    if ratio > 0:
+        need = max(floor, int(np.ceil(ratio * max(int(n_panel), 1))))
+    else:
+        need = floor
+    return bool(int(n_dates) >= need), int(need)
 
 # LLM因子注册槽位 (由每日策略研究产出填充)
 LLM_FACTOR_REGISTRY = [
@@ -186,11 +225,58 @@ def get_blocked_names():
 # ============================================================
 # Part A2: Stage 1 → Stage 2 因子扩充交接
 # ============================================================
+# ── P-20260910-002: 可证伪提案前置门 ──────────────────────
+# 因子须带 (hypothesis/mechanism/predicted_direction/refutation_conditions) 四元组。
+# 缺 refutation_conditions 时自动补默认模板 (宽松); FUXI_FALSIFIABLE_GATE=enforce
+# 时四元组任一缺失直接剔除。方向证伪比对在 run_daily Step 3 执行。
+DEFAULT_REFUTATION = ("若截面 IC 符号与预测方向相反或 |ICIR|<0.05, 则假设被证伪, "
+                      "以本地实证 IC 方向为准 (方向本地实证翻转铁律)")
+
+_DIRECTION_SIGN = {"long": 1, "positive": 1, "short": -1, "negative": -1}
+
+
+def _ensure_falsifiable(hyp: dict, source: str = "") -> dict:
+    """补齐可证伪四元组字段。返回 (hyp, ok)。FUXI_FALSIFIABLE_GATE=enforce 时
+    四元组 (hypothesis/logic/direction/refutation_conditions) 任一缺失 → ok=False。"""
+    enforce = os.environ.get("FUXI_FALSIFIABLE_GATE") == "enforce"
+    hyp = dict(hyp)
+    hyp['direction'] = hyp.get('direction') or 'long'
+    hyp['refutation_conditions'] = hyp.get('refutation_conditions') or DEFAULT_REFUTATION
+    ok = True
+    if enforce:
+        missing = [k for k in ('hypothesis', 'logic', 'direction', 'refutation_conditions')
+                   if not str(hyp.get(k, '')).strip()]
+        if missing:
+            print(f"  ⛔ [可证伪门] {hyp.get('name', '?')} ({source}) 四元组缺失: {missing}")
+            ok = False
+    return hyp, ok
+
+
+def _record_falsification_event(factor_name: str, predicted_direction: str,
+                                ic_mean: float, icir: float, date_str: str):
+    """P-20260910-002: 方向证伪事件写入 Experience Memory falsification_log。"""
+    try:
+        mem_path = PROJECT_ROOT / 'data' / 'experience_memory.json'
+        data = json.loads(mem_path.read_text(encoding='utf-8')) if mem_path.exists() else {}
+        log = data.setdefault('falsification_log', [])
+        log.append({
+            'factor_name': factor_name,
+            'date': date_str,
+            'predicted_direction': predicted_direction,
+            'ic_mean': float(ic_mean),
+            'icir': float(icir),
+            'note': '截面 IC 符号与预测方向相反, 以本地实证方向为准',
+        })
+        mem_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception as e:
+        print(f"    [falsification_log] 写入失败 (不阻塞): {e}")
+
+
 def load_stage1_proposals():
     """从 Stage 1 因子扩充探索产出读取待验证因子提案。
 
     自动排除已测/已入池/FA 已有因子 (与 get_blocked_names 一致)。
-    返回 List[dict], 每项已归一化为标准字段 (name/label/formula/hypothesis/logic/category)。
+    返回 List[dict], 每项已归一化为标准字段 (name/label/formula/hypothesis/logic/category/direction/refutation_conditions)。
     """
     if not STAGE1_PROPOSALS_FILE.exists():
         return []
@@ -215,6 +301,14 @@ def load_stage1_proposals():
         np_norm['hypothesis'] = p.get('economic_rationale', p.get('hypothesis', ''))
         np_norm['logic'] = p.get('economic_rationale', p.get('logic', ''))
         np_norm['category'] = p.get('paradigm', p.get('target_problem', ''))
+        np_norm['direction'] = p.get('direction', p.get('predicted_direction', 'long'))
+        np_norm['predicted_direction'] = np_norm['direction']
+
+        # 🆕 P-20260910-002: 可证伪四元组补齐 / enforce 剔除
+        np_norm, _ok = _ensure_falsifiable(np_norm, source='stage1')
+        if not _ok:
+            n_rejected += 1
+            continue
 
         # 🆕 P-021: 公式预检 — 提前拒绝不可执行的公式, 避免浪费 S1-S5 评估时间
         is_valid, warnings, _ = validate_and_preprocess_formula(
@@ -256,9 +350,29 @@ _FORGE_FUNCTION_PATTERNS = [
 # 虚构列名 — 不在 OHLCV + 资金流数据中
 _GHOST_COLUMNS = [
     'rd_expense', 'rd_capitalized', 'rd_staff', 'revenue', 'goodwill',
-    'net_profit', 'total_assets', 'north_money', 'buy_elg_vol',
+    'net_profit', 'total_assets', 'north_money',
     'concept_label', 'industry_code',
+    # 注意: buy_elg_vol 已于 P-20260814-002 接入 data_loader_ext (load_moneyflow_wide 返回
+    # 第4/5个字段), 2026-09-07 从幻影列名中移除 (P-20260907-001 落地), 防公式预检误杀。
 ]
+
+# 预检错误提示中的真实可用字段清单 (与 data_loader_ext 加载保持同步)
+_AVAILABLE_COLS_HINT = (
+    "OHLCV(open/high/low/close/vol/amount/pre_close) + "
+    "衍生(returns/overnight/amplitude/turnover/hl_ratio, 与 FactorICComputer 同口径) + "
+    "资金流(buy_sm_vol/sell_sm_vol/buy_lg_vol/sell_lg_vol/buy_elg_vol/sell_elg_vol/net_mf_amount) + "
+    "龙虎榜(lhb_flag/lhb_net_amount/lhb_net_rate/lhb_inst_*/lhb_north_*/lhb_yz_*) + "
+    "两融(rzye/rqye/rzmre/rqyl/rqchl/rzche/rqmcl/rzrqye) + 北向(north_vol/north_ratio) + "
+    "基本面(roe/eps/eps_qoq/netprofit_yoy/roe_dt/tr_yoy) + 分析师(eps_disp/tp_disp/rating_disp/n_cover) + "
+    "估值(circ_mv/total_mv/pb/ps_ttm/pe_ttm/dv_ratio/dv_ttm/kd_ps_pct_own) + "
+    "快刀基本面(kd_total_assets/kd_money_cap/kd_trad_asset/kd_accounts_receiv/kd_notes_receiv/"
+    "kd_goodwill/kd_st_borr/kd_lt_borr/kd_bond_payable/kd_adv_receipts/kd_contract_liab/"
+    "kd_revenue_ttm/kd_n_income_ttm/kd_revenue_ann/kd_n_income_ann/"
+    "kd_ncf_act_ttm/kd_c_fr_sale_sg_ttm/kd_capex_ttm/kd_profit_dedt_ttm/"
+    "kd_holder_num/kd_holder_num_yoy/kd_top10_hold_sum/kd_top10_hold_ratio/kd_cash_div_12m/"
+    "kd_holder_net_ratio_3m/kd_holder_in_ratio_3m/kd_holder_de_ratio_3m/"
+    "kd_repurchase_flag_3m/kd_repurchase_price_3m/kd_repurchase_amt_12m)"
+)
 
 # Python 内置冲突 — 需要预处理的列名
 # 'open' 是 Python 内置函数 open(); 在 eval() 中如果 locals 未显式覆盖,
@@ -304,7 +418,7 @@ def validate_and_preprocess_formula(formula: str, factor_name: str = "") -> tupl
     if ghost_hits:
         warnings.append(
             f"公式引用了不存在的列名 {ghost_hits}, "
-            f"数据仅含 OHLCV + buy_lg_vol/sell_lg_vol/buy_sm_vol/sell_sm_vol"
+            f"数据仅含 {_AVAILABLE_COLS_HINT}"
         )
         return False, warnings, formula
 
@@ -331,6 +445,46 @@ def validate_and_preprocess_formula(formula: str, factor_name: str = "") -> tupl
             warnings.append(f"公式语法错误 (括号不配平或非法表达式): {_se.msg}")
             return False, warnings, formula
 
+    # ── 5. pandas Rolling 对象非法链检测 ──
+    # P-20260904: Ralph LLM 生成 .rolling(N).pct_change() → eval AttributeError
+    # (Rolling 无 pct_change; 正确: series.pct_change(N) 或 .rolling().mean().pct_change())
+    _roll_bad = re.search(r'\.rolling\([^)]*\)\s*\)?\s*\.\s*(pct_change|pct_chg)\s*\(', formula)
+    if _roll_bad:
+        warnings.append(
+            f"非法链: Rolling 对象无 {_roll_bad.group(1)} 方法 "
+            f"(应改用 series.{_roll_bad.group(1)}(N) 或 .rolling().mean() 后再调用)"
+        )
+        return False, warnings, formula
+
+    # ── 6. P-20260910-001: 静态因果闭包校验 (shadow 默认: 只记录不拦截) ──
+    try:
+        import sys as _sys
+        from pathlib import Path as _P
+        _fa_dir = str(_P(__file__).resolve().parents[1] / "research" / "factor_alchemy")
+        if _fa_dir not in _sys.path:
+            _sys.path.insert(0, _fa_dir)
+        from causal_closure_check import check_causal_closure, record_batch, should_block
+        cc = check_causal_closure(formula)
+        if cc["verdict"] != "ok":
+            record_batch([{
+                "factor": factor_name, "formula_preview": formula[:80],
+                "verdict": cc["verdict"], "violations": cc["violations"],
+                "warnings": cc["warnings"],
+            }])
+            if should_block(cc["verdict"]):
+                warnings.append(
+                    f"因果闭包违规 (前视): {'; '.join(cc['violations'])}"
+                )
+                return False, warnings, formula
+            elif cc["verdict"] == "fatal":
+                warnings.append(
+                    f"[shadow] 因果闭包违规 (未拦截): {'; '.join(cc['violations'])}"
+                )
+            else:
+                warnings.append(f"[shadow] 因果闭包警告 (未拦截): {'; '.join(cc['warnings'])}")
+    except Exception:
+        pass  # 校验器不可用时静默降级, 不阻塞 Stage2
+
     return True, warnings, formula
 
 
@@ -345,7 +499,13 @@ def prune_stage1_proposals(tested_name):
     proposals = data.get('proposals', []) if isinstance(data, dict) else data
     new_proposals = [p for p in proposals if (p.get('factor_name') or p.get('name')) != tested_name]
     if len(new_proposals) != len(proposals):
-        out = {'proposals': new_proposals} if isinstance(data, dict) else new_proposals
+        # 2026-09-07 修复: 保留 dict 中的其他键 (如 pending_fina), 旧逻辑 {'proposals': ...}
+        # 重写会静默丢失 pending_fina 待财务数据条目。
+        if isinstance(data, dict):
+            out = dict(data)
+            out['proposals'] = new_proposals
+        else:
+            out = new_proposals
         STAGE1_PROPOSALS_FILE.write_text(
             json.dumps(out, ensure_ascii=False, indent=2), encoding='utf-8')
 
@@ -762,7 +922,7 @@ NOVEL_FACTOR_LIBRARY = [
         'category': 'research_driven',
         'hypothesis': '个股相对截面均值的超额动量反映行业内部轮动',
         'logic': '6月流动性因子占优: 个股超额动量=行业轮动alpha载体',
-        'formula': 'close_p.pct_change(10) - close_p.mean(axis=1).pct_change(10)',  # 超额收益
+        'formula': 'close_p.pct_change(10).sub(close_p.mean(axis=1).pct_change(10), axis=0)',  # 超额收益
         'direction': 'long',
     },
     {
@@ -1067,7 +1227,7 @@ NOVEL_FACTOR_LIBRARY = [
         'category': 'sentiment_crowding',
         'hypothesis': '个股收益与市场收益绝对偏差小(接近市场)的股票羊群效应强→反转',
         'logic': 'Christie&Huang(1995)羊群效应: 市场极端波动时个股收益趋同→羊群; 低偏差=跟风→后续反转',
-        'formula': '-(1 - (close_p.pct_change() - close_p.mean(axis=1).pct_change()).abs().rolling(20).mean())',
+        'formula': '-(1 - (close_p.pct_change().sub(close_p.mean(axis=1).pct_change(), axis=0)).abs().rolling(20).mean())',
         'direction': 'long',
     },
     {
@@ -1096,7 +1256,7 @@ NOVEL_FACTOR_LIBRARY = [
         'category': 'momentum_dynamics',
         'hypothesis': '剔除市场和行业收益后的残差动量比原始动量更纯净(不受Beta干扰)',
         'logic': 'Blitz et al.(2011)残差动量: 残差收益反映个股特有Alpha→比总收益动量更稳定的选股信号',
-        'formula': '(close_p / close_p.shift(20) - 1) - (close_p.mean(axis=1) / close_p.mean(axis=1).shift(20) - 1)',
+        'formula': '(close_p / close_p.shift(20) - 1).sub(close_p.mean(axis=1) / close_p.mean(axis=1).shift(20) - 1, axis=0)',
         'direction': 'long',
     },
 
@@ -1368,8 +1528,8 @@ NOVEL_FACTOR_LIBRARY = [
         'category': 'alpha_dynamics',
         'hypothesis': '剔除市场因素后5日/60日相对加速的股票(特质动量增强)Alpha更显著',
         'logic': 'Blitz et al.(2011)残差动量V2: 短期特质收益加速/长期=信号增强; 短期主导长期=Alpha积累',
-        'formula': '(close_p.pct_change(5) - close_p.pct_change().mean(axis=1).rolling(5).sum()) / '
-                   '((close_p.pct_change(60) - close_p.pct_change().mean(axis=1).rolling(60).sum()).abs() + 0.001)',
+        'formula': '(close_p.pct_change(5).sub(close_p.pct_change().mean(axis=1).rolling(5).sum(), axis=0)) / '
+                   '((close_p.pct_change(60).sub(close_p.pct_change().mean(axis=1).rolling(60).sum(), axis=0)).abs() + 0.001)',
         'direction': 'long',
     },
     {
@@ -2405,8 +2565,787 @@ NOVEL_FACTOR_LIBRARY = [
         'formula': '(close_p.pct_change() * (volume_p / (volume_p.rolling(20).mean() + 1)).rolling(60).rank(pct=True)).rolling(60).sum()',
         'direction': 'long',
     },
+    {
+        'id': 'novel_202',
+        'name': 'ts_decay_ewm_halflife10',
+        'label': '指数衰减加权收益(ewm 半衰期10日)',
+        'category': 'ts_decay',
+        'hypothesis': '近端收益信息权重大于远端, 衰减加权比等权动量响应更快',
+        'logic': 'WQ101 decay_linear 族: ewm 指数衰减权重替代等权 rolling mean (纯 pandas, 无 np 依赖)',
+        'formula': 'close_p.pct_change().ewm(halflife=10).mean()',
+        'direction': 'long',
+    },
+    {
+        'id': 'novel_203',
+        'name': 'mkt_neutralized_momentum_20',
+        'label': '市场中性化动量(20日超额市场动量, 行业中性待 P-001 升级)',
+        'category': 'indneutralize',
+        'hypothesis': '剔除市场 Beta 后的动量是个股特有信息, 拥挤度更低',
+        'logic': 'WQ101 indneutralize 族降级版: 宽表 .mean(axis=1) 减全市场截面均值; 行业级中性化待 P-20260908-001 sw 行业映射接入后升级',
+        'formula': '(close_p.pct_change(20).sub(close_p.pct_change(20).mean(axis=1), axis=0))',
+        'direction': 'long',
+    },
+    {
+        'id': 'novel_204',
+        'name': 'signedpower_ret_20_15',
+        'label': '符号幂收益(20日收益^1.5保符号)',
+        'category': 'signedpower',
+        'hypothesis': '保符号幂放大大幅波动股的信号强度, 小波动股被压缩',
+        'logic': 'WQ101 signedpower 族: sign(x)*|x|^a 对极端收益敏感化 (x/|x| 实现符号, 无 np 依赖)',
+        'formula': '((close_p.pct_change(20) / (close_p.pct_change(20).abs() + 1e-8)) * close_p.pct_change(20).abs() ** 1.5)',
+        'direction': 'long',
+    },
 
+    # ============= P-20260910-004: 多尺度复杂性 (分形粗糙度/长记忆 × 回撤-恢复几何) =============
+    # 库普查: fractal/hurst/multi_scale/geometry 命中 0 — 唯一完全空白范式。
+    # 方向均为假设断言 (P-20260910-002 可证伪四元组), 以本地 S1 IC 实证符号为准。
+    {
+        'id': 'novel_205', 'name': 'hurst_vr_60_20',
+        'label': '变差比近似Hurst(20步/1步, 60窗)',
+        'category': 'multi_scale_complexity',
+        'hypothesis': '分形市场假说: VR>1 长记忆正自相关(Hurst>0.5)趋势延续, VR<1 均值回归',
+        'logic': 'Lo-MacKinlay 变差比简化: var(r_20)/(20*var(r_1)); >1 趋势, <1 反转',
+        'formula': '(close_p.pct_change(20).rolling(60).var() / 20) / (close_p.pct_change().rolling(60).var() + 1e-8)',
+        'direction': 'long',
+        'refutation_conditions': '若 IC 符号为负(VR<1 反转占优)或 |ICIR|<0.05 则方向证伪, 以实证符号为准',
+    },
+    {
+        'id': 'novel_206', 'name': 'multi_scale_vol_ratio_5_20',
+        'label': '多尺度波动比(5日/20日, 粗糙度)',
+        'category': 'multi_scale_complexity',
+        'hypothesis': '短窗波动相对长窗越高=路径越粗糙(Hurst 低), 粗糙路径噪声大未来收益弱',
+        'logic': 'CogAlpha Level V: 多尺度波动率比值谱度量粗糙度; 高比值=白噪声主导',
+        'formula': 'close_p.pct_change().rolling(5).std() / (close_p.pct_change().rolling(20).std() + 1e-8)',
+        'direction': 'short',
+        'refutation_conditions': '若 IC 符号为正或 |ICIR|<0.05 则方向证伪',
+    },
+    {
+        'id': 'novel_207', 'name': 'multi_scale_vol_ratio_5_60',
+        'label': '多尺度波动比(5日/60日, 长尺度粗糙度)',
+        'category': 'multi_scale_complexity',
+        'hypothesis': '极短窗 vs 长窗波动比捕捉长记忆衰减速度; 比值高=短记忆白噪声',
+        'logic': 'Hurst 指数与波动尺度律: 尺度比值谱斜率≈粗糙度; 5/60 比谱比 5/20 更平稳',
+        'formula': 'close_p.pct_change().rolling(5).std() / (close_p.pct_change().rolling(60).std() + 1e-8)',
+        'direction': 'short',
+        'refutation_conditions': '若 IC 符号为正或 |ICIR|<0.05 则方向证伪',
+    },
+    {
+        'id': 'novel_208', 'name': 'rough_path_ratio_20',
+        'label': '路径粗糙度(20步路径长度/1步路径长度和)',
+        'category': 'multi_scale_complexity',
+        'hypothesis': '长步累计波动/短步累计波动=路径粗糙度代理; 越粗糙(Hurst 越低)未来噪声越大',
+        'logic': '分形路径长度随尺度幂律增长; 比值偏离 1/sqrt(k) 度量粗糙度',
+        'formula': 'close_p.pct_change(20).abs().rolling(60).sum() / (close_p.pct_change().abs().rolling(60).sum() * (20 ** 0.5) + 1e-8)',
+        'direction': 'short',
+        'refutation_conditions': '若 IC 符号为正或 |ICIR|<0.05 则方向证伪',
+    },
+    {
+        'id': 'novel_209', 'name': 'hurst_vr_60_step60',
+        'label': '变差比近似Hurst(60步/1步, 60窗)',
+        'category': 'multi_scale_complexity',
+        'hypothesis': '更长步长变差比对长记忆更敏感; VR60>1 强趋势延续',
+        'logic': 'Lo-MacKinlay VR 长步长版: var(r_60)/(60*var(r_1)); 长记忆成分在长步长更显著',
+        'formula': '(close_p.pct_change(60).rolling(60).var() / 60) / (close_p.pct_change().rolling(60).var() + 1e-8)',
+        'direction': 'long',
+        'refutation_conditions': '若 IC 符号为负或 |ICIR|<0.05 则方向证伪; 窗口不足(样本<150截面)时不裁决',
+    },
+    {
+        'id': 'novel_210', 'name': 'vol_spectrum_slope',
+        'label': '波动率谱斜率(长窗扩张-短窗扩张差)',
+        'category': 'multi_scale_complexity',
+        'hypothesis': '谱斜率为正(长窗波动扩张快于短窗)=波动聚集上升=风险积聚, 未来收益受压',
+        'logic': '多尺度谱: (60/20 波动比)-(20/5 波动比) 度量谱斜率, 捕捉波动聚集的非对称演化',
+        'formula': '(close_p.pct_change().rolling(60).std() / (close_p.pct_change().rolling(20).std() + 1e-8)) - (close_p.pct_change().rolling(20).std() / (close_p.pct_change().rolling(5).std() + 1e-8))',
+        'direction': 'short',
+        'refutation_conditions': '若 IC 符号为正或 |ICIR|<0.05 则方向证伪',
+    },
+    {
+        'id': 'novel_211', 'name': 'dd_path_asymmetry',
+        'label': '回撤路径对称性(下跌斜率/反弹斜率)',
+        'category': 'multi_scale_complexity',
+        'hypothesis': '下跌斜率>反弹斜率(急跌慢涨)的股票含负偏信息, 未来继续走弱; 慢跌急涨(V型)则反转修复',
+        'logic': '回撤-恢复几何: 负收益均值/正收益均值度量路径非对称; 急跌慢涨=派发结构',
+        'formula': 'close_p.pct_change().where(close_p.pct_change() < 0).rolling(20, min_periods=5).mean().abs() / (close_p.pct_change().where(close_p.pct_change() > 0).rolling(20, min_periods=5).mean() + 1e-8)',
+        'direction': 'short',
+        'refutation_conditions': '若 IC 符号为正或 |ICIR|<0.05 则方向证伪',
+    },
+    {
+        'id': 'novel_212', 'name': 'dd_max_depth_20_60',
+        'label': '20日最深回撤(相对60日高点)',
+        'category': 'multi_scale_complexity',
+        'hypothesis': '近 20 日最深回撤深的股票(近高点大幅回落)短期均值回归修复',
+        'logic': '回撤深度维度: 相对 60 日高点的 20 日极值深度; 深度极端=超卖',
+        'formula': '-((close_p / close_p.rolling(60).max()) - 1).rolling(20).min()',
+        'direction': 'long',
+        'refutation_conditions': '若 IC 符号为负或 |ICIR|<0.05 则方向证伪',
+    },
+    {
+        'id': 'novel_213', 'name': 'dd_recovery_speed_5',
+        'label': '回撤恢复速度(5日相对修复幅度)',
+        'category': 'multi_scale_complexity',
+        'hypothesis': '近 5 日从局部低点快速修复的股票有承接力量, 动量延续',
+        'logic': '恢复速度维度: 相对 60 日高点序列的 5 日修复幅度; 修复快=买盘主动',
+        'formula': '(close_p / close_p.rolling(60).max() - (close_p / close_p.rolling(60).max()).rolling(5).min()) * 100',
+        'direction': 'long',
+        'refutation_conditions': '若 IC 符号为负或 |ICIR|<0.05 则方向证伪',
+    },
+    {
+        'id': 'novel_214', 'name': 'dd_recurrence_freq',
+        'label': '回撤复发频率(20日内跌破95%高位线天数)',
+        'category': 'multi_scale_complexity',
+        'hypothesis': '频繁跌破 95% 高位线的股票处于脆弱结构, 未来走弱',
+        'logic': '回撤复发维度: 高位线反复失守=支撑薄弱=派发; 频率高=脆弱性',
+        'formula': '((close_p / close_p.rolling(60).max()) < 0.95).astype(float).rolling(20).sum()',
+        'direction': 'short',
+        'refutation_conditions': '若 IC 符号为正或 |ICIR|<0.05 则方向证伪',
+    },
+    {
+        'id': 'novel_215', 'name': 'dd_geometry_curvature',
+        'label': '回撤-恢复曲率(相对高位序列二阶差分10日均)',
+        'category': 'multi_scale_complexity',
+        'hypothesis': '相对高位序列曲率为正(修复加速)的股票形态转强',
+        'logic': '几何曲率维度: 相对高位序列的加速度(二阶差分)度量恢复形态凸性',
+        'formula': '(close_p / close_p.rolling(60).max()).diff().diff().rolling(10).mean()',
+        'direction': 'long',
+        'refutation_conditions': '若 IC 符号为负或 |ICIR|<0.05 则方向证伪',
+    },
+    {
+        'id': 'novel_216', 'name': 'dd_highline_skew',
+        'label': '相对高位序列偏度(60窗)',
+        'category': 'multi_scale_complexity',
+        'hypothesis': '相对高位序列正偏(长期低于高位后急拉)的股票修复动能强',
+        'logic': '形态偏度维度: 相对高位序列三阶矩刻画高位停留-急杀-急拉的非对称形态',
+        'formula': '(close_p / close_p.rolling(60).max()).rolling(60).skew()',
+        'direction': 'long',
+        'refutation_conditions': '若 IC 符号为负或 |ICIR|<0.05 则方向证伪',
+    },
+
+    # ============================================================
+    # A1 条件化因子族 (novel_217~226, 2026-09-10 注入)
+    # 结构: 信号 × 状态权重(中心化截面 rank), 乘性无掩码 → 规避 0 平局陷阱
+    # 实证依据: crowded_volume_share_reversal_5d (ICIR 0.328 PASS) 与
+    # peer_dev_* 同伴效应族 (09-06 PASS) 均属"状态条件化"结构
+    # ============================================================
+    {
+        'id': 'novel_217', 'name': 'crowd_turnover_reversal_10d',
+        'label': '拥挤度加权10日反转',
+        'category': 'conditional_state',
+        'hypothesis': '高成交拥挤的股票10日收益反转更强, 低拥挤股反转效应弱',
+        'logic': '拥挤度(10日均量截面rank)中心化后加权反转信号, 与 crowded_volume_share_reversal_5d 同族换状态变量(成交额→成交量)',
+        'formula': '-(close_p.pct_change(10)) * ((volume_p.rolling(10).mean().rank(axis=1, pct=True)) - 0.5)',
+        'direction': 'long',
+        'refutation_conditions': '若高拥挤组 10 日收益动量延续(IC 符号与反转假设相反)或 |ICIR|<0.05 则证伪',
+    },
+    {
+        'id': 'novel_218', 'name': 'low_amp_momentum_5d',
+        'label': '低振幅加权5日动量',
+        'category': 'conditional_state',
+        'hypothesis': '低振幅(窄幅整理)状态下5日动量延续, 高波动股动量噪声大',
+        'logic': '振幅(高低价比-1)5日均值截面rank中心化, 低振幅股获得动量权重, 高振幅股反向下注',
+        'formula': 'close_p.pct_change(5) * (0.5 - ((high_p / low_p - 1).rolling(5).mean().rank(axis=1, pct=True) - 0.5))',
+        'direction': 'long',
+        'refutation_conditions': '若低振幅股5日收益反转(IC为负)或 |ICIR|<0.05 则证伪',
+    },
+    {
+        'id': 'novel_219', 'name': 'vol_expand_momentum_20d',
+        'label': '波动扩张加权20日动量',
+        'category': 'conditional_state',
+        'hypothesis': '波动率扩张状态(20日std>60日std)下的20日动量延续更强',
+        'logic': '波动扩张差(20日std-60日std)截面rank中心化加权20日收益, 刻画趋势启动期的量价共振',
+        'formula': 'close_p.pct_change(20) * ((close_p.pct_change().rolling(20).std() - close_p.pct_change().rolling(60).std()).rank(axis=1, pct=True) - 0.5)',
+        'direction': 'long',
+        'refutation_conditions': '若波动扩张期动量反而反转(IC为负)或 |ICIR|<0.05 则证伪',
+    },
+    {
+        'id': 'novel_220', 'name': 'turnover_shock_reversal_5d',
+        'label': '量比突增加权5日反转',
+        'category': 'conditional_state',
+        'hypothesis': '量比突增(当日量/20日均量)的股票5日收益反转, 放量后短期过度反应',
+        'logic': '量比偏离度截面rank中心化加权5日反转, 放量程度越极端反转权重越大',
+        'formula': '-(close_p.pct_change(5)) * (((volume_p / volume_p.rolling(20).mean().shift(1)) - 1).rank(axis=1, pct=True) - 0.5)',
+        'direction': 'long',
+        'refutation_conditions': '若放量股5日动量延续(IC符号与反转相反)或 |ICIR|<0.05 则证伪',
+    },
+    {
+        'id': 'novel_221', 'name': 'quiet_accum_breakout_20d',
+        'label': '低振幅加权20日相对强度',
+        'category': 'conditional_state',
+        'hypothesis': '窄幅整理(低振幅)后的20日相对均线超额预示向上突破',
+        'logic': '低振幅状态权重 × 20日相对均线超额, 刻画安静吸筹后的方向选择',
+        'formula': '(close_p / close_p.rolling(20).mean() - 1) * (0.5 - ((high_p / low_p - 1).rolling(20).mean().rank(axis=1, pct=True) - 0.5))',
+        'direction': 'long',
+        'refutation_conditions': '若窄幅后20日相对强度反转(IC为负)或 |ICIR|<0.05 则证伪',
+    },
+    {
+        'id': 'novel_222', 'name': 'crowd_fade_momentum_60d',
+        'label': '高拥挤加权60日动量反转',
+        'category': 'conditional_state',
+        'hypothesis': '高成交拥挤股票60日中期动量反转, 拥挤透支后均值回归',
+        'logic': '60日平均量截面rank中心化加权60日反转, 与 lhb 上榜频次负信号(拥挤=负向)呼应',
+        'formula': '-(close_p.pct_change(60)) * ((volume_p.rolling(60).mean().rank(axis=1, pct=True)) - 0.5)',
+        'direction': 'long',
+        'refutation_conditions': '若高拥挤股60日动量延续(IC符号与反转相反)或 |ICIR|<0.05 则证伪',
+    },
+    {
+        'id': 'novel_223', 'name': 'liq_state_reversal_10d',
+        'label': '低流动性加权10日反转',
+        'category': 'conditional_state',
+        'hypothesis': '低流动性(冷门)股票的10日反转效应更强, 冷门股定价效率低',
+        'logic': '流动性(20日均量rank)反向下注: 低流动性股获得反转权重, 高流动性股反向下注',
+        'formula': '-(close_p.pct_change(10)) * (0.5 - (volume_p.rolling(20).mean().rank(axis=1, pct=True) - 0.5))',
+        'direction': 'long',
+        'refutation_conditions': '若低流动性股10日动量延续(IC符号与反转相反)或 |ICIR|<0.05 则证伪',
+    },
+    {
+        'id': 'novel_224', 'name': 'hl_squeeze_cont_5d',
+        'label': '高低价挤压加权5日动量',
+        'category': 'conditional_state',
+        'hypothesis': '5日高低价区间收窄(挤压)后的短期动量延续',
+        'logic': '区间收窄度(5日max/min比)截面rank反向下注 × 5日动量, 与 CF 窄幅建仓逻辑同源',
+        'formula': 'close_p.pct_change(5) * (0.5 - (((high_p.rolling(5).max() / low_p.rolling(5).min()) - 1).rank(axis=1, pct=True) - 0.5))',
+        'direction': 'long',
+        'refutation_conditions': '若挤压后5日收益反转(IC为负)或 |ICIR|<0.05 则证伪',
+    },
+    {
+        'id': 'novel_225', 'name': 'dual_crowd_contrarian_20d',
+        'label': '拥挤波动双高加权20日反转',
+        'category': 'conditional_state',
+        'hypothesis': '成交拥挤+波动率双高状态的20日反转最强, 双高=投机过热',
+        'logic': '拥挤rank与波动rank等权复合后中心化加权20日反转, 双高股获得最强反转权重',
+        'formula': '-(close_p.pct_change(20)) * (((volume_p.rolling(20).mean().rank(axis=1, pct=True)) + (close_p.pct_change().rolling(20).std().rank(axis=1, pct=True))) * 0.5 - 0.5)',
+        'direction': 'long',
+        'refutation_conditions': '若双高状态股20日动量延续(IC符号与反转相反)或 |ICIR|<0.05 则证伪',
+    },
+    {
+        'id': 'novel_226', 'name': 'calm_momentum_20d',
+        'label': '低波动加权20日动量',
+        'category': 'conditional_state',
+        'hypothesis': '低波动状态下的20日动量延续更强(低波质量动量)',
+        'logic': '波动率(20日std)截面rank反向下注 × 20日动量, 与 P3 红利策略低波=alpha 实证呼应',
+        'formula': 'close_p.pct_change(20) * (0.5 - (close_p.pct_change().rolling(20).std().rank(axis=1, pct=True) - 0.5))',
+        'direction': 'long',
+        'refutation_conditions': '若低波动股20日收益反转(IC为负)或 |ICIR|<0.05 则证伪',
+    },
+    {
+        'id': 'kd_bp',
+        'name': 'kuaidao_bp',
+        'label': '快刀·账面市值比(1/PB)',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '低 PB 在全A截面有正向超额',
+        'logic': '快刀估值层核心。实测 ICIR +0.341 / t=+2.16 (31月, 全A)',
+        'formula': '(1.0 / pb).where(pb > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_ep_ttm',
+        'name': 'kuaidao_ep_ttm',
+        'label': '快刀·盈利收益率(1/PE_TTM)',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '低 PE_TTM 有正向超额',
+        'logic': '实测 ICIR +0.173。亏损股 PE 为空 → 自动剔除',
+        'formula': '(1.0 / pe_ttm).where(pe_ttm > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_sp_ttm',
+        'name': 'kuaidao_sp_ttm',
+        'label': '快刀·销售收益率(1/PS_TTM)',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '低 PS 有正向超额 (非稳定盈利公司的主估值口径)',
+        'logic': '实测 ICIR +0.260; 净现金调整版 adj_sp_inv 更强 +0.282',
+        'formula': '(1.0 / ps_ttm).where(ps_ttm > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_ps_own_pct_low',
+        'name': 'kuaidao_ps_own_pct_low',
+        'label': '快刀·PS自身历史分位取负',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': 'PS 处于自身 250 日低位 = 相对历史便宜',
+        'logic': '把「非稳定盈利门控」整体因子化。实测 ICIR +0.4125 / t=+2.18 (全表第3强)。分位在加载器内用完整历史预计算 (kd_ps_pct_own)',
+        'formula': '-kd_ps_pct_own',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_dv_yield',
+        'name': 'kuaidao_dv_yield',
+        'label': '快刀·股息率(TTM)',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '高股息有正向超额 (股东回报层)',
+        'logic': '实测 ICIR +0.117。替代原 div_yield 自算口径 (口径更标准)',
+        'formula': 'dv_ttm',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_payout_ratio',
+        'name': 'kuaidao_payout_ratio',
+        'label': '快刀·股利支付率',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '适度分红有正向超额, 异常分红(>100%)是套现嫌疑',
+        'logic': '实测 ICIR +0.149 (非单调)。恒等式: payout = dv_ratio*pe/100',
+        'formula': '(dv_ratio * pe_ttm / 100.0).where((dv_ratio > 0) & (pe_ttm > 0))',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_net_cash_to_mv',
+        'name': 'kuaidao_net_cash_to_mv',
+        'label': '快刀·净现金占市值比',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '净现金厚(能覆盖负债后的冗余现金)的公司更抗跌',
+        'logic': '给调整后市值口径提供暴露。实测 ICIR +0.045 (弱, 但为 PR 结构件)',
+        'formula': '_nc = kd_money_cap.fillna(0) + kd_trad_asset.fillna(0) - kd_st_borr.fillna(0) - kd_lt_borr.fillna(0) - kd_bond_payable.fillna(0)\nfactor = _nc / (total_mv * 1e4)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_est_np_yield_mv',
+        'name': 'kuaidao_est_np_yield_mv',
+        'label': '快刀·预估净利/市值',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '增长市盈率的倒数 (PR 分子端), 不清洗现金',
+        'logic': '实测 ICIR +0.214 / t=+1.19。用 TTM 净利作预估净利代理',
+        'formula': '(kd_n_income_ttm / (total_mv * 1e4)).where(kd_n_income_ttm > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_adj_sp_inv',
+        'name': 'kuaidao_adj_sp_inv',
+        'label': '快刀·营收/调整后市值',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '净现金调整后的销售收益率 (PS 口径剔除冗余现金)',
+        'logic': '实测 ICIR +0.282, 强于未调整的 1/PS_TTM (+0.260) → 销售口径上净现金调整加分',
+        'formula': '_nc = kd_money_cap.fillna(0) + kd_trad_asset.fillna(0) - kd_st_borr.fillna(0) - kd_lt_borr.fillna(0) - kd_bond_payable.fillna(0)\nfactor = (kd_revenue_ttm / (total_mv * 1e4 - _nc)).where((total_mv * 1e4 - _nc) > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_growth_pe_inv',
+        'name': 'kuaidao_growth_pe_inv',
+        'label': '快刀·预估净利/调整后市值',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '增长市盈率的倒数, 清洗冗余现金',
+        'logic': '实测 ICIR +0.192 / t=+1.03 (盈利口径上净现金调整小幅减分)',
+        'formula': '_nc = kd_money_cap.fillna(0) + kd_trad_asset.fillna(0) - kd_st_borr.fillna(0) - kd_lt_borr.fillna(0) - kd_bond_payable.fillna(0)\nfactor = (kd_n_income_ttm / (total_mv * 1e4 - _nc)).where((kd_n_income_ttm > 0) & ((total_mv * 1e4 - _nc) > 0))',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_ar_low',
+        'name': 'kuaidao_ar_low',
+        'label': '快刀·应收账款占比取负',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '应收账款占营收越低越好 (收入质量)',
+        'logic': '快刀 2.3a: 应收/营收 <=20% 为 +1 条件之一。实测原始占比 ICIR -0.073 (弱)',
+        'formula': '-(kd_accounts_receiv / kd_revenue_ttm).where(kd_revenue_ttm > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_advance_receipt_ratio',
+        'name': 'kuaidao_advance_receipt_ratio',
+        'label': '快刀·(合同负债+预收)/营收',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '预收类负债多 = 下游景气 / 议价权强',
+        'logic': '快刀 2.3a 后半。⚠ 全A 实测 IC -0.374 与判定反向, 行业中性后归零 → 实为行业暴露, 接入供系统自行判定',
+        'formula': '((kd_contract_liab.fillna(0) + kd_adv_receipts.fillna(0)) / kd_revenue_ttm).where(kd_revenue_ttm > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_goodwill_low',
+        'name': 'kuaidao_goodwill_low',
+        'label': '快刀·商誉占比取负',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '商誉占资产越低越好 (减值暴雷风险)',
+        'logic': '快刀 2.3c。实测原始占比 ICIR -0.006 (近零)',
+        'formula': '-(kd_goodwill.fillna(0) / kd_total_assets).where(kd_total_assets > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_asset_heaviness',
+        'name': 'kuaidao_asset_heaviness',
+        'label': '快刀·资产重资产度',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '经营性资产占总资产比重 (剔除现金后的真实经营资产密度)',
+        'logic': '实测 ICIR +0.225, 行业中性后增强至 +0.372',
+        'formula': '((kd_total_assets - kd_money_cap.fillna(0) - kd_trad_asset.fillna(0)) / kd_total_assets).where(kd_total_assets > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_cash_receipt_ratio',
+        'name': 'kuaidao_cash_receipt_ratio',
+        'label': '快刀·收现比',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '销售商品收到的现金 / 营收 > 1 = 收入真实回款',
+        'logic': '快刀 2.4a。⭐ 数据 2026-09-11 补采 c_fr_sale_sg 后首次可算。未实测',
+        'formula': '(kd_c_fr_sale_sg_ttm / kd_revenue_ttm).where(kd_revenue_ttm > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_cashflow_to_profit',
+        'name': 'kuaidao_cashflow_to_profit',
+        'label': '快刀·净现比',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '经营现金流净额 / 净利润 > 1 = 利润有现金支撑 (Sloan 应计异象直接代理)',
+        'logic': '快刀 2.4b。⭐ 首次可算。未实测',
+        'formula': '(kd_ncf_act_ttm / kd_n_income_ttm).where(kd_n_income_ttm > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_capex_low',
+        'name': 'kuaidao_capex_low',
+        'label': '快刀·资本开支占比取负',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '维持性资本开支 / 经营现金流越低越好 (轻资产 / 造血强)',
+        'logic': '快刀 2.4c (阈值 <=10%)。⭐ 首次可算。未实测',
+        'formula': '-(kd_capex_ttm / kd_ncf_act_ttm).where(kd_ncf_act_ttm > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_fcf_yield',
+        'name': 'kuaidao_fcf_yield',
+        'label': '快刀·自由现金流收益率',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '(经营现金流 - 资本开支) / 总市值',
+        'logic': '快刀 2.4d。⭐ 首次可算。未实测',
+        'formula': '((kd_ncf_act_ttm - kd_capex_ttm.fillna(0)) / (total_mv * 1e4)).where(kd_ncf_act_ttm.notna())',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_nonrecurring_ratio',
+        'name': 'kuaidao_nonrecurring_ratio',
+        'label': '快刀·扣非净利占净利比',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '扣非净利 / 净利润越高 = 盈利越干净 (非经常性损益越少)',
+        'logic': '快刀 2.1 财务洗澡分支的代理。⭐ 首次可算 (fina_indicator.profit_dedt)。未实测',
+        'formula': '(kd_profit_dedt_ttm / kd_n_income_ttm).where(kd_n_income_ttm > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_insider_net_buy',
+        'name': 'kuaidao_insider_net_buy',
+        'label': '快刀·大股东净增持比例(近3月)',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '近 3 月大股东/高管净增持为正 = 内部人看多',
+        'logic': '实测 ICIR +0.160。阈值侧: 净增持 >0.03% 为 +1, 减持 <-0.03% 为 -1',
+        'formula': 'kd_holder_net_ratio_3m',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_buyback_to_mv',
+        'name': 'kuaidao_buyback_to_mv',
+        'label': '快刀·回购金额/市值(近12月)',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '回购力度大 = net share issuance 异象',
+        'logic': '🏆 全表最强: 实测 ICIR +0.465 / t=+2.59 / 胜率 74.2% (两轮一致)',
+        'formula': '(kd_repurchase_amt_12m / (total_mv * 1e4)).where(total_mv > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_buyback_discount',
+        'name': 'kuaidao_buyback_discount',
+        'label': '快刀·现价相对回购价折价',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '(回购均价 - 现价)/现价 > 0 = 现价低于公司自己的回购成本',
+        'logic': '快刀 2.8a 原意「当前股价低于回购价10%以上」。未实测',
+        'formula': '((kd_repurchase_price_3m - close) / close).where((kd_repurchase_price_3m > 0) & (close > 0))',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_holder_num_yoy_low',
+        'name': 'kuaidao_holder_num_yoy_low',
+        'label': '快刀·股东户数同比取负',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '股东户数下降 = 筹码集中 = 好',
+        'logic': '实测 ICIR +0.203 (取负后)。同比在加载器内于季频层预计算 (kd_holder_num_yoy)。⚠ full_top10 曾仅近2期, 2026-09-11 已回补至多期',
+        'formula': '-kd_holder_num_yoy',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_per_capita_value',
+        'name': 'kuaidao_per_capita_value',
+        'label': '快刀·散户人均持股市值',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '(总市值 - 前十大持股市值) / 股东户数, 30万以上为 +1',
+        'logic': '快刀 2.9 核心。实测原始值 ICIR -0.211 (门控池内翻转为 +0.055)',
+        'formula': '((total_mv * 1e4 - kd_top10_hold_sum.fillna(0) * close) / kd_holder_num).where(kd_holder_num > 0)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_top10_ratio',
+        'name': 'kuaidao_top10_ratio',
+        'label': '快刀·前十大股东持股比例',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '前十大持股比例高 = 筹码集中',
+        'logic': '快刀 2.9 的辅助口径。数据 2026-09-11 回补至 21 期',
+        'formula': 'kd_top10_hold_ratio',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_s2_score',
+        'name': 'kuaidao_s2_score',
+        'label': '快刀·十项打分第2项(ROE)',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': 'ROE >=15% 记 +1, <10% 记 -1',
+        'logic': '实测 ICIR -0.3564 / t=-1.98: 负向几乎全来自「低 ROE 扣分」支路 (2024-26 杀估值窗口)',
+        'formula': '(roe >= 15).astype(float) - (roe < 10).astype(float)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_s8_score',
+        'name': 'kuaidao_s8_score',
+        'label': '快刀·十项打分第8项(股权变动)',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '回购 或 大额增持 记 +1, 大额减持记 -1',
+        'logic': '🏆 十项里唯一强项, 两轮一致: 实测 ICIR +0.438 / t=+2.44',
+        'formula': '((kd_repurchase_amt_12m > 0) | (kd_holder_net_ratio_3m > 0.03)).astype(float) - (kd_holder_net_ratio_3m < -0.03).astype(float)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_gate_pass',
+        'name': 'kuaidao_gate_pass',
+        'label': '快刀·价格门控(0/1)',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '稳定盈利走 PR<=1.5 路径, 非稳定盈利走 PS 自身分位<=70% 路径',
+        'logic': '实测 ICIR +0.2585 / t=+1.42 (门控整体当因子须用 0/1; 连续 PR 值是零信号)。门控池 1349 只 = 全A 23.8%',
+        'formula': '_nc = kd_money_cap.fillna(0) + kd_trad_asset.fillna(0) - kd_st_borr.fillna(0) - kd_lt_borr.fillna(0) - kd_bond_payable.fillna(0)\n_pe = (total_mv * 1e4 - _nc) / kd_n_income_ttm.where(kd_n_income_ttm > 0)\n_pr = _pe / (roe.where(roe > 0) / 100.0)\nfactor = ((_pr <= 1.5) | (kd_ps_pct_own <= 0.70)).astype(float)',
+        'direction': 'long',
+    },
+    {
+        'id': 'kd_quality_value_inter',
+        'name': 'kuaidao_quality_value_inter',
+        'label': '快刀·质量价值交互',
+        'category': 'kuaidao_fundamental',
+        'hypothesis': '便宜且高质量 (bp 分位 + ROE 分位) 的组合暴露',
+        'logic': '把快刀「好公司 + 好价格」双条件合成为一个连续因子。未实测',
+        'formula': '_bp = (1.0 / pb).where(pb > 0)\nfactor = _bp.rank(pct=True).fillna(0.5) + roe.rank(pct=True).fillna(0.5)',
+        'direction': 'long',
+    },
+    # ============= P-20260914-001 Spread-Compression 拥挤诊断 (探索性, 未实测) =============
+    {
+        'id': 'novel_sc001',
+        'name': 'spread_compression_20d',
+        'label': 'Spread-Compression 拥挤侵蚀代理(20日相对溢价斜率, 取负)',
+        'category': 'sentiment_crowding',
+        'hypothesis': '相对截面溢价被持续压缩(斜率<0, 拥挤侵蚀)的股票短期出现反转修复; 溢价仍在扩张的股票动量延续',
+        'logic': 'P-20260914-001 (QuanterLab spread-compression 口径 + McLean&Pontiff 2016 发表后衰减58%): 股票级代理 = 20日日收益(vs 截面均值)的 OLS 时间斜率取负; 与 factor_level_crowding 的 corr 口径互补。未实测',
+        'formula': '_ret = close_p / close_p.shift(1) - 1\n_rel = _ret.sub(_ret.mean(axis=1), axis=0)\n_t = np.arange(20, dtype=float)\n_dev = _t - _t.mean()\n_den = (_dev ** 2).sum()\nfactor = -(_rel.rolling(20).apply(lambda s: (_dev * s).sum(), raw=True) / _den)',
+        'direction': 'long',
+    },
+    {
+        'id': 'novel_227',
+        'name': 'lion_bias',
+        'label': '涨停启动点贴近度(结构锚点)',
+        'category': 'behavioral_anchor',
+        'hypothesis': '现价贴近「最近一次涨停日之前最后一根阴线低点」的股票处于主力成本区, 下行空间有限且修复概率高',
+        'logic': '事件锚点(非固定窗口): 最近涨停=主力发力信号; 其前最后一根阴线低点=启动点/成本下沿; 现价/启动点越低=越贴近成本区→结构型反转。来源: 聚宽社区《变种小狮子 V3.0》bias 构造, 口径改为后复权比值。实测 RankIC -0.0250 / 日ICIR -0.178 (过闸); 但与本库 rev20/rev60 截面相关 0.40~0.48, 正交后 IC 仅 +0.0090 → 主要是反转代理',
+        'formula': 'lion_bias',
+        'direction': 'short',
+    },
+    {
+        'id': 'novel_228',
+        'name': 'lion_lu_days',
+        'label': '距最近涨停天数',
+        'category': 'event_decay',
+        'hypothesis': '距最近一次涨停越久(沉寂越深)的股票未来收益越高 —— 涨停后的注意力溢价随时间衰减',
+        'logic': '涨停=注意力事件, 其后接力资金与情绪溢价随时间衰减; 距涨停远=情绪已出清未被炒作。实测 RankIC +0.0439 / 日ICIR +0.410, 五分位单调性 +0.900 (Q1 -0.168% → Q5 +0.227%), 小/中/大市值三池 t = +5.65 / +8.35 / +2.64 全部显著。与本库 rev20/rev60 相关仅 +0.11/+0.21, 与 size -0.04 → 非反转/市值代理; 但与同源 lion_lu_cnt 相关 -0.655',
+        'formula': 'lion_lu_days',
+        'direction': 'long',
+    },
+    {
+        'id': 'novel_229',
+        'name': 'lion_lu_cnt',
+        'label': '760日涨停次数(涨停基因)',
+        'category': 'event_decay',
+        'hypothesis': '过去 760 交易日涨停次数越多的股票未来收益越低 —— 与社区「涨停基因」选股方向相反',
+        'logic': '涨停次数=历史被炒作程度; 炒作过的票套牢盘重、筹码分散。聚宽社区策略取涨停次数前 10% 当优势股池, 实测方向相反 (RankIC -0.0195, 五分位单调性 -1.000)。与 lion_lu_days 相关 -0.655 (同源两测度), 二者择一即可',
+        'formula': 'lion_lu_cnt',
+        'direction': 'short',
+    },
+
+    # ============= 多源分通道建模类 (P-20260916-001 落地, 2026-09-16) =============
+    # 来源: 国泰海通量化选股系列(五)《让深度学习因子适应不同市场环境》
+    #   实证: 多粒度深度学习因子与市值因子相关 -0.3, 根因是成交额/换手等风格高相关
+    #   特征在同一 GRU 注意力机制中被赋过高权重; 改为「分通道建模 + 相关性惩罚层」
+    #   后风格分位回归 50%、回撤降近 10%。
+    # 落地代理: 各通道独立构建截面 rank 信号后再组合 (而非同式混用异类字段),
+    #   以此在结构上避免「某类特征在共享参数中被吞并」。
+    {
+        'id': 'novel_230',
+        'name': 'mc_reversal_lgflow_equalweight',
+        'label': '分通道: 量价反转 × 大单资金流(等权)',
+        'category': 'multi_channel',
+        'hypothesis': '量价反转通道与主动大单资金流通道是低相关的两类信息, 各自截面 rank 后等权组合, 可避免单一通道在混合建模中被吞并',
+        'logic': '通道A=20日收益反转的截面分位; 通道B=大单净买占比5日均值的截面分位; 组合=0.5A+0.5B。两通道独立构建后才相加, 不在同一表达式内混用 close 与资金流字段。来源 P-20260916-001 / 国泰海通量化选股系列(五)',
+        'formula': "(-close_p.pct_change(20)).rank(pct=True, axis=1) * 0.5 + ((buy_lg_vol - sell_lg_vol) / (buy_lg_vol + sell_lg_vol + 1e-8)).rolling(5).mean().rank(pct=True, axis=1) * 0.5",
+        'direction': 'long',
+    },
+    {
+        'id': 'novel_231',
+        'name': 'mc_momentum_elgflow_gate',
+        'label': '分通道: 量价动量 × 超大单资金流(门控)',
+        'category': 'multi_channel',
+        'hypothesis': '仅当量价动量通道与超大单资金流通道同时处于高分位时才触发(相乘门控), 两个独立通道同时失效的概率相乘 → 组合对单一 regime 更稳健',
+        'logic': '通道A=20日动量的截面分位; 通道B=超大单净买占比10日均值的截面分位; 组合=A×B 门控式, 要求两个独立信号源同向才得高分。来源 P-20260916-001',
+        'formula': "(close_p.pct_change(20)).rank(pct=True, axis=1) * ((buy_elg_vol - sell_elg_vol) / (buy_elg_vol + sell_elg_vol + 1e-8)).rolling(10).mean().rank(pct=True, axis=1)",
+        # 落地日探针(270d, 不复权, fwd5): RankIC -0.0294 / ICIR 0.232 → 实证为负,
+        # 即「动量×超大单门控」在 A 股是反向指标(与库内「纯动量不可用」结论一致)。
+        # 按方向本地实证翻转铁律, 方向标 short 而非 long。
+        'direction': 'short',
+    },
+    {
+        'id': 'novel_232',
+        'name': 'mc_inst_minus_retail_divergence',
+        'label': '分通道: 机构通道 − 散户通道(资金结构分歧)',
+        'category': 'multi_channel',
+        'hypothesis': '机构通道与散户通道方向背离的股票未来收益更高 —— 机构净买而散户净卖代表筹码由弱手转向强手',
+        'logic': '通道A=大单+超大单净买占比5日均值的截面分位(机构通道); 通道B=小单净买占比5日均值的截面分位(散户通道); 组合=A−B。两通道各自独立构建 rank 后才相减, 避免在同一表达式内混用同源量纲。来源 P-20260916-001',
+        'formula': "((buy_lg_vol + buy_elg_vol - sell_lg_vol - sell_elg_vol) / (buy_lg_vol + buy_elg_vol + sell_lg_vol + sell_elg_vol + 1e-8)).rolling(5).mean().rank(pct=True, axis=1) - ((buy_sm_vol - sell_sm_vol) / (buy_sm_vol + sell_sm_vol + 1e-8)).rolling(5).mean().rank(pct=True, axis=1)",
+        'direction': 'long',
+    },
+    {
+        'id': 'novel_233',
+        'name': 'mc_dynamic_lowcorr_weight',
+        'label': '分通道: 动态低相关加权(三通道)',
+        'category': 'multi_channel',
+        'hypothesis': '按通道间 60 日滚动相关的绝对值倒数动态加权(低相关者高权), 可在通道相关性上升(风格趋同)时自动降权 —— 直接对应国泰海通「相关性惩罚层」',
+        'logic': '三通道=20日反转分位 / 大单净买分位 / 成交额集中分位; 权重 w=∏(1−|rolling_corr|), 逐通道乘权后相加。通道间相关性升高(两类信息趋同)时该项权重自动衰减, 等价于对风格暴露施加惩罚。多行赋值块实现。来源 P-20260916-001 / 国泰海通量化选股系列(五) 相关性惩罚层',
+        'formula': """ch_a = (-close_p.pct_change(20)).rank(pct=True, axis=1).fillna(0.5)
+ch_b = ((buy_lg_vol - sell_lg_vol) / (buy_lg_vol + sell_lg_vol + 1e-8)).rolling(5).mean().rank(pct=True, axis=1).fillna(0.5)
+ch_c = (amount / amount.rolling(20).sum()).rank(pct=True, axis=1).fillna(0.5)
+c_ab = ch_a.rolling(60).corr(ch_b).fillna(0.0).abs().clip(0.0, 1.0)
+c_ac = ch_a.rolling(60).corr(ch_c).fillna(0.0).abs().clip(0.0, 1.0)
+c_bc = ch_b.rolling(60).corr(ch_c).fillna(0.0).abs().clip(0.0, 1.0)
+w_a = (1.0 - c_ab) * (1.0 - c_ac)
+w_b = (1.0 - c_ab) * (1.0 - c_bc)
+w_c = (1.0 - c_ac) * (1.0 - c_bc)
+factor = w_a * ch_a + w_b * ch_b + w_c * ch_c
+""",
+        'direction': 'long',
+    },
+    # ============= 龙虎榜三路资金合力 (P-20260917-022, 2026-09-17) =============
+    # 来源: 2026-09-17 前沿扫描 D 维度 —— 9/16 光迅科技(002281)涨停, 深股通净买
+    #       4.61亿 + 3家机构净买 2.53亿 + 游资(紫阳东路/环城北路)净买 4.09亿, 三路同日合力超10亿。
+    # 三路定义: lhb_north_net_buy(深股通/沪股通专用席位) / lhb_inst_net_buy(机构专用)
+    #          / lhb_yz_net_buy(排除机构与北向后的游资营业部)。
+    # 口径约定: load_top_list_wide 已 reindex+fillna(0) ⇒ **未上榜 = 0**。故三路同日
+    #          同为正才构成合力, 缺任意一路即不成立 —— 这是定义本身, 不是 fillna 伪装信号。
+    {
+        'id': 'novel_234',
+        'name': 'lhb_triple_resonance_5d',
+        'label': '龙虎榜三路资金合力强度(5日累积)',
+        'category': 'lhb_resonance',
+        'hypothesis': '龙虎榜深股通、机构专用、游资营业部三路资金同日同向净买入的股票, 后续收益显著高于单路资金买入的股票',
+        'logic': '三路资金代表三类独立信息源(外资定价/机构研究/游资情绪); 同日同向净买=多源信息共振, 是稀缺强信号(单路买入可能仅是风格暴露)。合力强度=三路净额之和, 5日累积后取截面分位。',
+        'formula': """_n = lhb_north_net_buy.fillna(0.0)
+_i = lhb_inst_net_buy.fillna(0.0)
+_y = lhb_yz_net_buy.fillna(0.0)
+_res = ((_n > 0) & (_i > 0) & (_y > 0)).astype(float)
+factor = ((_n + _i + _y) * _res).rolling(5).sum().rank(pct=True, axis=1).fillna(0.5)""",
+        'direction': 'long',
+        'source': 'P-20260917-022',
+    },
+    {
+        'id': 'novel_235',
+        'name': 'lhb_triple_resonance_persist_20d',
+        'label': '龙虎榜三路资金合力持续性(20日频次)',
+        'category': 'lhb_resonance',
+        'hypothesis': '近20日内三路资金合力出现频次高的股票(反复被多路资金共同买入)比一次性合力的股票更有持续性',
+        'logic': '单次合力可能是事件驱动(涨停/公告); 20日内反复合力=资金持续建仓, 属筹码由弱手转强手的持续过程。用频次而非强度, 与 novel_234 的强度维度正交。',
+        'formula': """_both = ((lhb_north_net_buy.fillna(0.0) > 0) & (lhb_inst_net_buy.fillna(0.0) > 0) & (lhb_yz_net_buy.fillna(0.0) > 0)).astype(float)
+factor = _both.rolling(20).sum().rank(pct=True, axis=1).fillna(0.5)""",
+        'direction': 'long',
+        'source': 'P-20260917-022',
+    },
+    {
+        'id': 'novel_236',
+        'name': 'lhb_triple_agree_minus_disagree_10d',
+        'label': '龙虎榜三路资金方向净一致性(10日累积)',
+        'category': 'lhb_resonance',
+        'hypothesis': '三路资金方向净一致(同买次数减同卖次数)高的股票未来收益更高 —— 方向一致性比净额大小更能区分信息共振与单路主导',
+        'logic': 'novel_234 用净额强度, 会被单路巨量主导(如某游资单笔巨额); 本因子只数方向一致性: 三路同买=+1, 三路同卖=−1, 其余=0, 10日累积。剔除金额量纲影响, 是纯"共识"度量。',
+        'formula': """_n = lhb_north_net_buy.fillna(0.0)
+_i = lhb_inst_net_buy.fillna(0.0)
+_y = lhb_yz_net_buy.fillna(0.0)
+_dir = ((_n > 0) & (_i > 0) & (_y > 0)).astype(float) - ((_n < 0) & (_i < 0) & (_y < 0)).astype(float)
+factor = _dir.rolling(10).sum().rank(pct=True, axis=1).fillna(0.5)""",
+        'direction': 'long',
+        'source': 'P-20260917-022',
+    },
+    # ============= 龙虎榜三路资金**分歧度** (P-20260918-001, 2026-09-18) =============
+    # 🔴 与 novel_234/235/236 的关键差异: 那三条用 `fillna(0)` 后直接 rolling ⇒
+    #    非上榜日三路全为 0, 「三路同买」恒不成立 ⇒ 序列里绝大多数样本是「平局 0」,
+    #    截面 rank 被大量 0 值占位稀释, 分歧/共识的**区分度被摊平**。
+    #    本组改为 **先锚在上榜日** (lhb_flag > 0 或任一路非零), 只在真实上榜样本上
+    #    度量分歧度, 再对「上榜样本」做时序聚合 ⇒ 不引入 fillna(0) 的假信号。
+    # 🔴 待验风险 (须在 S5 复核): 本组在宽表 (index=日期) 下 rank(pct,axis=1) 是
+    #    截面分位; 而 S5 `_build_series_context` 是**逐股 Series** 上下文, axis=1 语义
+    #    不同 (novel_234/235/236 存在同样问题, 属既有口径, 本组沿用不扩大差异)。
+    {
+        'id': 'novel_237',
+        'name': 'lhb_3way_divergence_20d',
+        'label': '龙虎榜三路资金方向分歧度(20日累积, 仅上榜样本)',
+        'category': 'lhb_divergence',
+        'hypothesis': '上榜日三路资金方向不一致(有买有卖)的股票, 后续收益显著低于三路方向一致的股票 —— 分歧是"缺乏共识"的信号',
+        'logic': '三路各取符号 sign(净额), 分歧度 = 1 - |Σsign|/3 ∈ [0, 1]: 三路同向=0, 两同一异=1/3, 一买一卖互斥=2/3~1。只在上榜日累积 (未上榜日不计入分子也不计分母) ⇒ 度量的纯是"有多分歧"而非"上没上榜"。取负向 (分歧高=看空)。',
+        'formula': """_n = lhb_north_net_buy.fillna(0.0)
+_i = lhb_inst_net_buy.fillna(0.0)
+_y = lhb_yz_net_buy.fillna(0.0)
+_on = (lhb_flag.fillna(0.0) > 0) | (_n != 0) | (_i != 0) | (_y != 0)
+_sgn = np.sign(_n) + np.sign(_i) + np.sign(_y)
+_div = (1.0 - (_sgn.abs() / 3.0)).where(_on, 0.0)
+factor = -_div.rolling(20).mean().rank(pct=True, axis=1).fillna(0.5)""",
+        'direction': 'negative',
+        'source': 'P-20260918-001',
+    },
+    {
+        'id': 'novel_238',
+        'name': 'lhb_3way_concentration_20d',
+        'label': '龙虎榜三路资金单路主导度(20日均值, 仅上榜样本)',
+        'category': 'lhb_divergence',
+        'hypothesis': '上榜日由单一资金路径主导(其余两路几乎无参与)的股票, 后续收益低于三路均衡参与的股票 —— 单路主导多为事件性炒作, 缺乏多源背书',
+        'logic': '主导度 = max(|n|,|i|,|y|) / (|n|+|i|+|y|) ∈ [1/3, 1]: 三路完全均衡=1/3, 单路独揽=1。与 novel_237 正交 —— 237 看**方向**分歧, 238 看**量能**集中度 (三路可能同向但量能全在游资一路)。仅上榜样本。',
+        'formula': """_n = lhb_north_net_buy.fillna(0.0).abs()
+_i = lhb_inst_net_buy.fillna(0.0).abs()
+_y = lhb_yz_net_buy.fillna(0.0).abs()
+_tot = _n + _i + _y
+_on = _tot > 0
+_conc = np.maximum(np.maximum(_n, _i), _y) / _tot.replace(0.0, np.nan)
+_conc = _conc.where(_on, np.nan)
+factor = (-_conc).rolling(20, min_periods=1).mean().rank(pct=True, axis=1).fillna(0.5)""",
+        'direction': 'negative',
+        'source': 'P-20260918-001',
+    },
+    {
+        'id': 'novel_239',
+        'name': 'lhb_yz_vs_smart_20d',
+        'label': '龙虎榜游资相对机构+北向净额差(20日累积, 仅上榜样本)',
+        'category': 'lhb_divergence',
+        'hypothesis': '上榜日游资净买入相对「机构+北向」更强(游资主导)的股票, 后续收益低于机构+北向主导的股票 —— 游资资金更短视',
+        'logic': '定义 _smart = _i + _n (机构+北向=信息型), _hot = _y (游资=情绪型), 差值 _hot - _smart 只在上榜日累积。这是**分路归因**而非 net 合计: 同样是净买入 1 亿, 由机构买入 vs 由游资买入含义不同。novel_234 的合力强度把两路人当成同质的, 本因子做异质拆分。',
+        'formula': """_n = lhb_north_net_buy.fillna(0.0)
+_i = lhb_inst_net_buy.fillna(0.0)
+_y = lhb_yz_net_buy.fillna(0.0)
+_on = (lhb_flag.fillna(0.0) > 0) | (_n != 0) | (_i != 0) | (_y != 0)
+_hot = (_y - (_i + _n)).where(_on, 0.0)
+factor = (-_hot.rolling(20).sum()).rank(pct=True, axis=1).fillna(0.5)""",
+        'direction': 'negative',
+        'source': 'P-20260918-001',
+    },
+    {
+        'id': 'novel_240',
+        'name': 'lhb_smart_agree_hot_dissent_20d',
+        'label': '龙虎榜「机构+北向同向 / 游资反向」分歧(20日频次)',
+        'category': 'lhb_divergence',
+        'hypothesis': '机构与北向同向、游资反向的股票, 后续收益高于三者同向的股票 —— 信息型资金与情绪型资金对立时, 跟信息型资金胜率更高',
+        'logic': '典型「聪明钱 vs 游资」对立场景。_smart_ag = (sign(_i)==sign(_n)) & (_i!=0) & (_n!=0); _hot_opp = sign(_y) == -sign(_i)。同时满足且 _smart_ag 方向为正(买入)则 +1, 为负(卖出)则 -1 ⇒ 20日累积。这是方向**结构**条件, 而非金额大小, 与金额类因子正交。',
+        'formula': """_n = lhb_north_net_buy.fillna(0.0)
+_i = lhb_inst_net_buy.fillna(0.0)
+_y = lhb_yz_net_buy.fillna(0.0)
+_sa = (np.sign(_i) == np.sign(_n)) & (_i != 0) & (_n != 0)
+_opp = (_y != 0) & (np.sign(_y) != np.sign(_i))
+_hit = (_sa & _opp).astype(float) * np.sign(_i)
+factor = _hit.rolling(20).sum().rank(pct=True, axis=1).fillna(0.5)""",
+        'direction': 'long',
+        'source': 'P-20260918-001',
+    },
 ]
+
 
 
 # ============================================================
@@ -2428,19 +3367,31 @@ def compute_ic_icir(factor_values, forward_returns):
         if not np.isnan(ic):
             ic_series.append((dt, ic))
 
+    n_panel = len(common_dates)
     if not ic_series:
         return {'ic_mean': np.nan, 'ic_std': np.nan, 'icir': np.nan,
-                '+ic%': np.nan, 'ic_series': pd.Series(dtype=float)}
+                'icir_raw': np.nan, '+ic%': np.nan,
+                'ic_series': pd.Series(dtype=float),
+                'n_dates': 0, 'n_panel_dates': n_panel,
+                'n_dates_enough': False, 'n_dates_required': 0}
 
     ic_vals = pd.Series([x[1] for x in ic_series],
                         index=[x[0] for x in ic_series])
     ic_mean = ic_vals.mean()
     ic_std = ic_vals.std()
-    icir = abs(ic_mean / ic_std) if ic_std > 0 else np.nan
+    icir_raw = abs(ic_mean / ic_std) if ic_std > 0 else np.nan
+
+    # ── v0.7.29 跨截面样本量门槛 (防稀疏截面假 PASS) ──
+    #   不达标 → icir 置 NaN ⇒ 下游全部 5 处 `icir >= ICIR_THRESHOLD` 判定自动收紧,
+    #   无需改裁决点(零遗漏); icir_raw / n_dates_enough 保留供诊断与审计。
+    _enough, _need = _ic_dates_gate(len(ic_series), n_panel)
 
     return {
         'ic_mean': ic_mean, 'ic_std': ic_std,
-        'icir': abs(ic_mean / ic_std) if ic_std > 0 else np.nan,
+        'icir': icir_raw if _enough else np.nan,
+        'icir_raw': icir_raw,
+        'n_dates': len(ic_series), 'n_panel_dates': n_panel,
+        'n_dates_enough': _enough, 'n_dates_required': _need,
         '+ic%': (ic_vals > 0).mean(), 'ic_series': ic_vals,
     }
 
@@ -2455,7 +3406,7 @@ def load_data(n_days=270):
     daily = pd.read_csv(
         local_path,
         dtype={'ts_code': str, 'trade_date': str},
-        usecols=['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'vol', 'amount']
+        usecols=['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'vol', 'amount']
     )
     # 统一日期格式: CSV中混有YYYYMMDD和YYYY-MM-DD两种格式
     daily['trade_date'] = pd.to_datetime(daily['trade_date'], format='mixed')
@@ -2469,10 +3420,12 @@ def load_data(n_days=270):
     low_df = daily.pivot(index='trade_date', columns='ts_code', values='low')
     vol_df = daily.pivot(index='trade_date', columns='ts_code', values='vol')
     amount_df = daily.pivot(index='trade_date', columns='ts_code', values='amount')
+    pre_close_df = daily.pivot(index='trade_date', columns='ts_code', values='pre_close')
 
     min_days = 40
     valid_codes = close_df.columns[close_df.count() >= min_days]
-    for nm in ['close_df', 'open_df', 'high_df', 'low_df', 'vol_df', 'amount_df']:
+    for nm in ['close_df', 'open_df', 'high_df', 'low_df', 'vol_df', 'amount_df',
+               'pre_close_df']:
         locals()[nm] = locals()[nm][valid_codes]
 
     daily_index = close_df.index
@@ -2484,6 +3437,17 @@ def load_data(n_days=270):
     extra = {}
     # P-20260815-002: 成交额接入 (交易行为双因子需要 amount 算 VWAP/大单占比)
     extra['amount'] = amount_df
+    # P-20260906-003: pre_close 接入 (涨停判定 close/pre_close - 1 用, 未复权口径)
+    extra['pre_close'] = pre_close_df
+    # P-20260907-007: 衍生字段接入 (与 FactorICComputer 派生口径一致)
+    # 修复 S1 过 → Stage2 NameError: FD 翻译白名单含 returns/amplitude 等, 但
+    # load_data 此前不提供 → 9 条 fd 因子 (含 fd_skewness S1 ICIR 0.7415) 静默错误。
+    # 语义与 factor_ic_computer._load_data 派生字段完全一致 (wide 口径):
+    extra['returns'] = close_df.pct_change()
+    extra['overnight'] = open_df / close_df.shift(1) - 1
+    extra['amplitude'] = (high_df - low_df) / close_df.shift(1)
+    extra['turnover'] = vol_df / close_df.clip(lower=0.01)
+    extra['hl_ratio'] = high_df / low_df.clip(lower=0.01)
     if _EXT_DATA_AVAILABLE:
         try:
             roe_df, eps_df = load_fundamental_wide(daily_index, daily_cols)
@@ -2516,6 +3480,11 @@ def load_data(n_days=270):
                 extra['rzmre'] = mg_data[2]
                 extra['rqyl'] = mg_data[3]
                 extra['rqchl'] = mg_data[4]
+                # P-20260911-margin (2026-09-11): 新增 3 列 (融资偿还额/融券卖出量/两融余额)
+                if len(mg_data) > 7:
+                    extra['rzche'] = mg_data[5]
+                    extra['rqmcl'] = mg_data[6]
+                    extra['rzrqye'] = mg_data[7]
         except Exception as e:
             print(f'  [两融] 加载失败: {e}')
 
@@ -2535,6 +3504,11 @@ def load_data(n_days=270):
                     extra['lhb_north_net_buy'] = tl_data[7]
                     extra['lhb_north_buy'] = tl_data[8]
                     extra['lhb_north_sell'] = tl_data[9]
+                # P-20260904-004: 游资营业部 (排除机构专用/北向专用后的营业部)
+                if len(tl_data) > 10:
+                    extra['lhb_yz_net_buy'] = tl_data[10]
+                    extra['lhb_yz_buy'] = tl_data[11]
+                    extra['lhb_yz_sell'] = tl_data[12]
         except Exception as e:
             print(f'  [龙虎榜] 加载失败: {e}')
 
@@ -2568,11 +3542,16 @@ def load_data(n_days=270):
         except Exception as e:
             print(f'  [财务成长] 加载失败: {e}')
 
-        # P-20260827-004: 流通市值 + 行业 L1 代码接入 (规模/行业条件化因子)
+        # P-20260827-004 + P-20260911-kd: 估值宽表 + 行业 L1 代码接入
+        # P-20260911-kd 起 load_valuation_wide 返回 7 字段 (日频直出, 原月末快照会
+        # 让同月内因子值恒定 → 高估 IC 自相关); 解包必须同步扩展。
         try:
             val_data = load_valuation_wide(daily_index, daily_cols)
             if val_data[0] is not None:
-                extra['circ_mv'] = val_data[0]
+                for nm, w in zip(['circ_mv', 'total_mv', 'pb', 'ps_ttm', 'pe_ttm',
+                                  'dv_ratio', 'dv_ttm', 'kd_ps_pct_own'], val_data):
+                    if w is not None:
+                        extra[nm] = w
         except Exception as e:
             print(f'  [估值] 加载失败: {e}')
         try:
@@ -2582,6 +3561,17 @@ def load_data(n_days=270):
         except Exception as e:
             print(f'  [行业] 加载失败: {e}')
 
+        # P-20260911-kd: 快刀斩股基本面通道 (2026-09-11 接入)
+        # 资产负债 / 利润TTM / 现金流TTM(收现比·净现比·资本开支比·FCF) / 扣非 /
+        # 分红 / 大股东增减持 / 股东户数 / 前十大合计 / 回购。
+        # 数据源 data/raw/kuaidao_gaps/; 季频先在季层做 TTM 再 ann_date asof(+1日)。
+        try:
+            kd_extra = load_kuaidao_fund_wide(daily_index, daily_cols)
+            if kd_extra:
+                extra.update(kd_extra)
+        except Exception as e:
+            print(f'  [快刀基本面] 加载失败: {e}')
+
         # P-20260819-003: 申万 L1 行业 peer 收益接入 (Salience DS)
         try:
             ind_peer = load_industry_wide(daily_index, daily_cols)
@@ -2589,6 +3579,39 @@ def load_data(n_days=270):
                 extra['industry_ret_peer'] = ind_peer
         except Exception as e:
             print(f'  [行业] 加载失败: {e}')
+
+        # P-20260906-001: 任意量价特征行业均值宽表 (双重同伴效应分解)
+        try:
+            fp_data = load_feature_peer_wide(daily_index, daily_cols)
+            if fp_data[0] is not None:
+                extra['ind_avg_amount'] = fp_data[0]
+                extra['ind_avg_turnover'] = fp_data[1]
+                extra['ind_avg_amplitude'] = fp_data[2]
+                extra['ind_avg_returns'] = fp_data[3]
+        except Exception as e:
+            print(f'  [行业peer] 加载失败: {e}')
+
+        # P-20260906-003: 涨停生态市场级指标 (涨停家数/开板率/溢价, 截面广播)
+        try:
+            lu_data = load_limit_up_wide(daily_index, daily_cols)
+            if lu_data[0] is not None:
+                extra['limit_up_count'] = lu_data[0]
+                extra['limit_up_open_rate'] = lu_data[1]
+                extra['limit_up_premium'] = lu_data[2]
+        except Exception as e:
+            print(f'  [涨停生态] 加载失败: {e}')
+
+        # P-20260915-lion: 狮子锚点 (最近涨停日→启动点结构锚点, 后复权比值口径)
+        # 来源: 聚宽社区《变种小狮子 V3.0》bias 构造, 审计见
+        # reports/lion_v3_strategy_audit_20260915.md
+        try:
+            lion_data = load_lion_anchor_wide(daily_index, daily_cols)
+            if lion_data[0] is not None:
+                extra['lion_bias'] = lion_data[0]
+                extra['lion_lu_days'] = lion_data[1]
+                extra['lion_lu_cnt'] = lion_data[2]
+        except Exception as e:
+            print(f'  [狮子锚点] 加载失败: {e}')
     else:
         print('  [扩展数据] 不可用 (data_loader_ext 未安装)')
 
@@ -2833,10 +3856,12 @@ def add_to_pool(factor_info, passed=False):
         existing = pd.read_csv(POOL_CSV)
         if factor_info['name'] in existing['name'].values:
             print(f"    [INFO] {factor_info['name']} 已在因子池中, 更新记录")
+            # 2026-09-07 修复: 复评/校正重跑时 status 必须同步更新
+            # (candidate↔reserve), 旧逻辑只更新 IC 数值 → 校正后 PASS 仍被记 reserve。
             existing.loc[existing['name'] == factor_info['name'],
-                        ['icir', 'ic_mean', '+ic_pct', 'date']] = [
+                        ['icir', 'ic_mean', '+ic_pct', 'date', 'status']] = [
                 factor_info['icir'], factor_info['ic_mean'],
-                factor_info['+ic%'], new_entry['date']
+                factor_info['+ic%'], new_entry['date'], new_entry['status']
             ]
             existing.to_csv(POOL_CSV, index=False, encoding='utf-8-sig')
             return False
@@ -2866,6 +3891,18 @@ def run_daily(llm_slot=False, require_stage1=False, n=20):
         print(f"  🤖 LLM因子槽位: 已启用 ({len(LLM_FACTOR_REGISTRY)} 个LLM因子待测)")
     print("=" * 70)
 
+    # ---- P-20260903-001: natural_freq 审计前置 (铁证才修正, 失败不阻塞) ----
+    try:
+        import sys as _sys
+        from pathlib import Path as _P
+        _fa_dir = str(_P(__file__).resolve().parents[1] / "research" / "factor_alchemy")
+        if _fa_dir not in _sys.path:
+            _sys.path.insert(0, _fa_dir)
+        from freq_audit import run_freq_audit
+        run_freq_audit(verbose=True)
+    except Exception:
+        pass
+
     # ---- 前置闸门: 当日 Stage 1 报告 ----
     if not check_stage1_gate(require_stage1, today):
         return None, 0
@@ -2894,6 +3931,17 @@ def run_daily(llm_slot=False, require_stage1=False, n=20):
         print("  ❌ 无可测的原创因子，请扩充 NOVEL_FACTOR_LIBRARY")
         return [], 0
 
+    # 🆕 P-20260910-002: 可证伪四元组补齐 (NOVEL/LLM 库因子缺 refutation_conditions 自动补默认)
+    _fals_hypotheses = []
+    for h in hypotheses:
+        h2, _ok = _ensure_falsifiable(h, source=h.get('source', 'novel'))
+        if _ok:
+            _fals_hypotheses.append(h2)
+    hypotheses = _fals_hypotheses
+    if not hypotheses:
+        print("  ❌ 可证伪门拦截后无可测因子 (FUXI_FALSIFIABLE_GATE=enforce)")
+        return [], 0
+
     # ---- Step 3: IC评估 ----
     print(f"\n[Step 3] IC评估 ({len(hypotheses)} 个全新因子)...")
     results = []
@@ -2903,6 +3951,22 @@ def run_daily(llm_slot=False, require_stage1=False, n=20):
 
         result = evaluate_factor(hyp, close_df, open_df, high_df, low_df, vol_df, forward_5d, extra=extra)
         results.append(result)
+
+        # 🆕 P-20260910-002: 方向证伪比对 (predicted_direction vs 本地实证 IC 符号)
+        pred_dir = str(hyp.get('predicted_direction', hyp.get('direction', ''))).strip().lower()
+        sign = _DIRECTION_SIGN.get(pred_dir)
+        ic_mean = result.get('ic_mean')
+        if sign is not None and 'error' not in result and not np.isnan(ic_mean):
+            if ic_mean * sign < 0:
+                result['direction_falsified'] = True
+                print(f"    🔄 [方向证伪] 预测 {pred_dir} (IC 预期 {'+' if sign > 0 else '-'}) "
+                      f"vs 实证 IC {ic_mean:+.4f} → 方向被证伪, 以实证符号为准")
+                _record_falsification_event(hyp['name'], pred_dir, ic_mean,
+                                            result.get('icir', np.nan), date_str)
+            else:
+                result['direction_falsified'] = False
+        else:
+            result['direction_falsified'] = None
 
         # 标记已测 (无论通过与否)
         mark_as_tested(hyp['name'], {
@@ -2973,6 +4037,25 @@ def run_daily(llm_slot=False, require_stage1=False, n=20):
                     print(f"    ✓ {r['label']} (ICIR={r['icir']:.3f}, +IC%={r['+ic%']:.1%})")
                     print(f"      → 已加入因子池 → 需要注册FA并运行 run_fa.py --full")
 
+            # P-20260908-006: PASS→S5/JQ 自动桥接 (修复入池后桥接悬空)。
+            # env FUXI_PASS_JQ_BRIDGE=on 启用 (默认 off 只盘点不生成);
+            # 独立 subprocess 失败不阻塞主流程; 幂等 (已在队列/同名文件跳过)。
+            try:
+                if os.environ.get('FUXI_PASS_JQ_BRIDGE') == 'on':
+                    import subprocess
+                    bridge = PROJECT_ROOT / 'scripts' / 'pass_to_jq_bridge.py'
+                    print(f"\n  [Bridge] FUXI_PASS_JQ_BRIDGE=on → 触发 PASS→S5/JQ 桥接...")
+                    r = subprocess.run(
+                        [sys.executable, str(bridge), '--execute', '--max-codegen', '10'],
+                        capture_output=True, text=True, timeout=1800, cwd=str(PROJECT_ROOT))
+                    tail = (r.stdout or '').strip().splitlines()[-8:]
+                    for line in tail:
+                        print(f"    {line}")
+                    if r.returncode != 0:
+                        print(f"    [Bridge] 退出码 {r.returncode} (不阻塞主流程)")
+            except Exception as _be:
+                print(f"  [Bridge] 桥接失败 (不阻塞): {_be}")
+
     # ---- Step 5: 保存报告 ----
     print("\n[Step 5] 保存报告...")
     report_file = DAILY_REPORT_DIR / f'daily_factor_{date_str}.csv'
@@ -3009,12 +4092,76 @@ def run_daily(llm_slot=False, require_stage1=False, n=20):
     # ── Step 5.5: 回写测试结果到 stage1_factor_proposals.json (Stage3 桥接) ──
     _sync_test_results_to_proposals(valid_results, date_str)
 
+    # ── Step 5.6: (P-20260925-001) Stage2 PASS → 完整 S1~S5 核验链路 ──
+    # 刻意放在日报落盘与提案池回写**之后**: 即便真实 S5 耗时或超时,
+    # 日报、回写、MEMORY 均已是安全状态, 不会因 S5 未完成而丢失主产物。
+    #   第一次调用(恒做): 刷新「待核验队列」→ 未做 S5 的 PASS 因子在流水线里必然可见;
+    #   第二次调用(仅 FUXI_STAGE2_S5_CHAIN=enforce, 历史别名 run): 对队列前 N 条执行真实 S5。
+    _run_stage2_s5_chain(execute=False)
+    _run_stage2_s5_chain(execute=True)
+
     # 库存警告
     if available_count - len(hypotheses) < 5:
         print(f"\n  ⚠️  原创因子库存不足! ({available_count - len(hypotheses)} 剩余)")
         print(f"  建议: 扩充 NOVEL_FACTOR_LIBRARY (当前{len(NOVEL_FACTOR_LIBRARY)}个)")
 
     return results, n_new_fa
+
+
+# ============================================================
+# P-20260925-001: Stage2 PASS → 完整 S1~S5 核验链路
+# ============================================================
+def _run_stage2_s5_chain(execute: bool = False):
+    """把 Stage2 判 PASS 的因子送进完整 S1~S5 核验链路。
+
+    立项背景（2026-09-25 审计）:
+      scripts/s135_candidate_check.py 自述「把 status=candidate 的因子重跑完整
+      S1-S5 管线」，通道本身**可跑**，但全仓库调用方 **0**（上次运行 2026-09-08
+      13:32）⇒ Stage2 PASS 入池后永久滞留 candidate，即「入池即终点」。
+      本函数就是那个缺失的调用方。
+
+    参数:
+      execute=False → 只刷新待核验队列（--queue-only，零回测成本，秒级）
+      execute=True  → 额外对队列前 N 条执行**真实** S5（--limit，成本高）
+
+    开关:
+      FUXI_STAGE2_S5_CHAIN = off | annotate(默认) | audit | enforce(历史别名 run)
+      FUXI_STAGE2_S5_LIMIT = 单次核验上限（默认 10）
+
+    失败语义:
+      子进程异常一律**不阻塞**主流程；真实 S5 未就绪时链路内部 fail-closed
+      （退出码 2）并留痕，**绝不静默降级**为 IC 年拆分轻量代理。
+    """
+    mode = str(os.environ.get('FUXI_STAGE2_S5_CHAIN', '') or '').strip().lower()
+    if mode not in ('off', 'annotate', 'audit', 'run', 'enforce'):
+        mode = 'annotate'
+    if mode == 'off':
+        return
+    if execute and mode not in ('run', 'enforce'):
+        return
+
+    chain = PROJECT_ROOT / 'scripts' / 'stage2_s5_chain.py'
+    if not chain.exists():
+        print(f"\n  [S5链] 未找到 {chain}（跳过）")
+        return
+
+    cmd = [sys.executable, str(chain)]
+    cmd += (['--limit', str(os.environ.get('FUXI_STAGE2_S5_LIMIT', '10'))]
+            if execute else ['--queue-only'])
+    print(f"\n  [S5链] FUXI_STAGE2_S5_CHAIN={mode} → "
+          f"{'执行真实 S1~S5' if execute else '刷新待核验队列'}...")
+    try:
+        import subprocess
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=7200 if execute else 300, cwd=str(PROJECT_ROOT))
+        for line in (r.stdout or '').strip().splitlines()[-12:]:
+            print(f"    {line}")
+        if execute and r.returncode == 2:
+            print("    [S5链] S5 引擎未就绪 → 已 fail-closed 留痕（未做轻量降级）")
+        elif r.returncode != 0:
+            print(f"    [S5链] 退出码 {r.returncode}，不阻塞主流程")
+    except Exception as _ce:
+        print(f"  [S5链] 触发失败，不阻塞主流程: {_ce}")
 
 
 # ============================================================
@@ -3109,6 +4256,11 @@ def show_library_stats():
 
 
 if __name__ == '__main__':
+    from pathlib import Path as _FuxiPath
+    import sys as _FuxiSys
+    _FuxiSys.path.insert(0, str(_FuxiPath(__file__).resolve().parents[1]))
+    from fuxi_v1.legacy_writers import legacy_cli_guard as _FuxiGuard
+    _fuxi_guard = _FuxiGuard(__file__, read_only='--stats' in sys.argv)
     import argparse
     parser = argparse.ArgumentParser(description='每日因子假设实验 v2 (原创去重)')
     parser.add_argument('--stats', action='store_true',

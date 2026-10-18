@@ -8,15 +8,14 @@ P-026 落地依赖: 龙虎榜 top_list (每日明细) + top_inst (机构席位)
   python scripts/top_list_update.py --days 5            # 每日增量: 补最近N个交易日
 """
 import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, 'e:/quant')
 from credentials import get_tushare_api
 import pandas as pd
 import time
 import os
 from datetime import datetime, timedelta
 
-BASE = str(Path(__file__).resolve().parent.parent / 'data' / 'raw')
+BASE = 'e:/quant/data/raw'
 TOP_LIST_PATH = os.path.join(BASE, 'top_list.csv')
 TOP_INST_PATH = os.path.join(BASE, 'top_inst.csv')
 FLUSH = lambda: sys.stdout.flush()
