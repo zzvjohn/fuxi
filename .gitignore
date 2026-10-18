@@ -22,12 +22,12 @@ build/
 # ---- Jupyter ----
 .ipynb_checkpoints/
 
-# ---- 数据与运行产物（体积大 / 含账户信息，不入库）----
-data/
-output/
-outputs/
-log/
-logs/
+# ---- 数据与运行产物（仅锚定仓库根目录；不要用裸 data/ output/，会误伤 research/**/data 等代码包）----
+/data/
+/output/
+/outputs/
+/log/
+/logs/
 *.log
 *.sqlite
 *.sqlite-journal
@@ -46,4 +46,4 @@ Thumbs.db
 .DS_Store
 
 # ---- WorkBuddy 内部状态（含记忆日志与团队协作数据）----
-.workbuddy/
+/.workbuddy/
