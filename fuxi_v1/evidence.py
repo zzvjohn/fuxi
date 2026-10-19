@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import time
 import uuid
+from .budgets import is_overrun
 from .contracts import canonical, digest, require, timestamp, keys, encode_fact_payload, load_fact
 
 
@@ -192,7 +193,7 @@ class EvidenceStore:
                             (state, actual_units, now(), canonical(result).decode(), attempt))
             self.append("attempt_settled", {"attempt_id": attempt, "state": state,
                                            "actual_units": actual_units, "result": result})
-            if actual_units > row["reserved"]:
+            if is_overrun(actual_units, row["reserved"]):
                 self.db.execute("UPDATE campaigns SET status='budget_overrun' WHERE id=?", (row["campaign"],))
 
     def recover(self, campaign_id):

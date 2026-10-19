@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import uuid
+from .budgets import budget_units as _budget_units
 from .contracts import digest, load_json, require, canonical
 from .governance import governed_writer, child_environment, find_workspace
 from .runtime import authority_location
@@ -21,8 +22,8 @@ from .artifacts import code_manifest
 from .effective_config import collect_effective_config
 
 SCHEMA='fuxi.unified_run.1'
-DEFAULT_LIMITS={'max_rounds':40,'max_candidates':80,'max_worker_seconds':300,
-                'max_total_seconds':28800,'max_memory_mb':2048,
+DEFAULT_LIMITS={'max_rounds':40,'max_candidates':80,'max_worker_seconds':420,
+                'max_total_seconds':36000,'max_memory_mb':2048,
                 'max_external_requests':30,'max_llm_calls':12,'max_output_tokens':24000}
 
 def file_sha(path):
@@ -82,7 +83,7 @@ def normalize_request(root, request):
     require(type(value['llm_enabled']) is bool,'llm flag must be boolean')
     require(isinstance(value['model_algorithms'],(list,tuple)) and
             set(value['model_algorithms'])<= {'ridge','lightgbm','xgboost'},'unknown model algorithm set')
-    value['model_algorithms']=tuple(value['model_algorithms'])
+    value['model_algorithms']=list(value['model_algorithms'])
     require(isinstance(value['external_hypotheses'],(list,tuple)),'external hypotheses must be a list')
     for h in value['external_hypotheses']:
         require(isinstance(h,dict) and set(h)<= {'mechanism','direction','source'} and
@@ -130,7 +131,7 @@ def _limits(identity, request):
             request['rounds']*request['candidates_per_round']<=limits['max_candidates'],'candidate budget exceeded')
     require(limits['max_worker_seconds']>=120 and limits['max_memory_mb']>=2048,
             'current native worker contract requires 120s and 2048MiB')
-    require(request['rounds']*request['candidates_per_round']*300+420<=limits['max_total_seconds'],
+    require(_budget_units(request['rounds'],request['candidates_per_round'])<=limits['max_total_seconds'],
             'native reservation exceeds workflow time budget')
     require(limits['max_external_requests']>=0 and limits['max_llm_calls']>=0 and limits['max_output_tokens']>=0,
             'external IO budget must be nonnegative')

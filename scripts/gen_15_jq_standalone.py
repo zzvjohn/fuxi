@@ -48,7 +48,9 @@ TEMPLATE = r'''# -*- coding: utf-8 -*-
 Rank IC: @IC@   ICIR: @ICIR@
 来源   : S4 完整 campaign, E0~E4 全 valid+pass (research 级, 已获 JQ candidate 资格)
 口径   : 全市场(0/3/6 开头, 剔 ST/停牌/涨停/次新) / top-30 等权 / 周频 /
-         真实下单(佣金0.01%+印花税0.1%+滑点0.3%) —— 产出组合收益曲线
+         真实下单(佣金0.01% + 卖出印花税0.1% + FixedSlippage(0.003)=双边0.003元/股)
+         注: FixedSlippage 的单位是元/股(单边 0.0015 元), 不是 0.3%;
+             若要做真实滑点压力测试, 改成 PriceRelatedSlippage(0.003) 另跑一版
          科创板 688/689: 限价保护价下单(市价单会被平台拒单), 单笔最小 200 股
 输出   : 1) 组合收益(真实下单口径) 2) 单因子 Rank IC/ICIR(P-001) 3) FINALJSON 行
 防未来 : avoid_future_data=True + 因子只用 T 日收盘/成交量 + get_price(end_date=T)
@@ -66,7 +68,7 @@ UNIV_CAP = 1300     # 横截面池子规模 (5.5万行/周铁律反推: lookback
 UNIV_SAMPLE = "spread"  # "spread"=全池等距抽样(覆盖 0/3/6); "head"=旧行为(按代码截断, 实际只剩 0 开头)
 MINLEN = 21         # 单票最少有效收盘价数
 RUN_END_DATE = ""   # 显式回测末日 YYYY-MM-DD; 留空则从 context.run_params.end_date 推断
-SLIP_PCT = 0.003    # 显式滑点率 (与 set_slippage 一致), 科创板限价保护价按此计算
+STAR_PROTECT_PCT = 0.003  # 科创板限价保护价的缓冲比例 (只是价格上限, 成交仍按最新价+滑点)
 STAR_PREFIX = ("688", "689")   # 科创板: 市价单必须带保护限价, 否则整单被拒
 STAR_MIN_LOT = 200  # 科创板单笔最小 200 股
 BENCHMARK = "000905.XSHG"   # 中证500
@@ -203,9 +205,11 @@ def _protect_style(s, d, side):
 
     聚宽规则: 科创板不接受无保护价的市价单
       ("科创板市价单需要指定保护限价, 取值必须大于 0 且小于 1 万元")。
-    买: ref*(1+SLIP_PCT) 向上取整到分, 不超过涨停价;
-    卖: ref*(1-SLIP_PCT) 向下取整到分, 不低于跌停价。
-    滑点在这里显式吃掉, 不再依赖 set_slippage 对限价单的处理。
+    买: ref*(1+STAR_PROTECT_PCT) 向上取整到分, 不超过涨停价;
+    卖: ref*(1-STAR_PROTECT_PCT) 向下取整到分, 不低于跌停价。
+    注意: 这是"保护价上限", 不是成交价 —— 聚宽对限价单的成交价仍是
+    min(委托价, 最新价+滑点) / max(委托价, 最新价-滑点), 所以缓冲留 0.3% 不额外增加成本,
+    只在委托价必须 >= 最新价+滑点 时保证能成交。
     """
     if not _is_star(s):
         return None
@@ -213,10 +217,10 @@ def _protect_style(s, d, side):
     if not ref or ref <= 0:
         return None
     if side == "buy":
-        px = min(ref * (1.0 + SLIP_PCT), getattr(d, "high_limit", ref * 1.2) or ref * 1.2)
+        px = min(ref * (1.0 + STAR_PROTECT_PCT), getattr(d, "high_limit", ref * 1.2) or ref * 1.2)
         px = math.ceil(px * 100.0 - 1e-9) / 100.0
     else:
-        px = max(ref * (1.0 - SLIP_PCT), getattr(d, "low_limit", ref * 0.8) or ref * 0.8)
+        px = max(ref * (1.0 - STAR_PROTECT_PCT), getattr(d, "low_limit", ref * 0.8) or ref * 0.8)
         px = math.floor(px * 100.0 + 1e-9) / 100.0
     if px <= 0:
         return None

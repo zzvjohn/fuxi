@@ -47,7 +47,7 @@ def paired_scores(left, right, start, end):
             "n_pairs": sum(x["n_pairs"] for x in sections)}
 
 
-def paired_accounts(candidate, baseline, request):
+def paired_accounts(candidate, baseline, request, *, enforce_absolute_excess=False, benchmark_root=None):
     require([r["session"] for r in candidate["daily"]] == [r["session"] for r in baseline["daily"]],
             "account/benchmark date window mismatch")
     require(candidate["market_hash"] == baseline["market_hash"] and candidate["assumptions"] == baseline["assumptions"],
@@ -62,12 +62,28 @@ def paired_accounts(candidate, baseline, request):
     from .research_protocol import inference
     interval = inference(delta, request, 731)
     readings = {"candidate": a, "baseline": b, "paired_net_delta": delta, "inference": interval,
-                "paired_mean_increment": mean(delta)}
+                "paired_mean_increment": mean(delta),
+                # 2026-10-19: paired increment and absolute excess are reported separately.
+                "paired_increment": {"mean": mean(delta), "lower": interval.get("lower"),
+                                     "status": interval.get("status"),
+                                     "threshold": request.get("minimum_net_increment_daily")}}
     if not candidate["formal_evidence"] or not baseline["formal_evidence"]:
         return evaluation("E3", "data_insufficient", "market_evidence_not_certified", scope="account",
                           diagnostics=readings, n_pairs=len(delta))
     passed = interval["status"] == "valid" and interval["lower"] > request["minimum_net_increment_daily"]
-    result = evaluation("E3", "valid", "paired_account_increment", decision="pass" if passed else "reject",
+    reason = "paired_account_increment"
+    if enforce_absolute_excess:
+        from .benchmarks import absolute_excess, excess_gate
+        excess = absolute_excess(candidate["daily"], root=benchmark_root)
+        readings["absolute_excess"] = excess
+        gate_ok, gate_reason = excess_gate(excess, a["total_return"])
+        readings["absolute_excess_gate"] = {"passed": gate_ok, "reason": gate_reason}
+        if not gate_ok:
+            # Paired increment alone is not enough when the candidate loses money
+            # in absolute terms: it must also beat both CSI300 and CSI500.
+            passed = False
+            reason = gate_reason
+    result = evaluation("E3", "valid", reason, decision="pass" if passed else "reject",
                         reject_class=None if passed else "economic", scope="account", metrics=readings, n_pairs=len(delta))
     # Consumers additionally verify source schema, scope, paired counts and data provenance.
     result["economic_reward_eligible"] = True
@@ -240,7 +256,7 @@ def pool_redundancy(scores, pool_scores, snapshot, labels, clock, start, end, re
             "corr_threshold": corr_threshold}
 
 
-def evaluate_candidate(candidate, scores, baseline_scores, snapshot, labels, market, policy, clock, *, top_n=6, baseline_cache=None, pool_scores=()):
+def evaluate_candidate(candidate, scores, baseline_scores, snapshot, labels, market, policy, clock, *, top_n=6, baseline_cache=None, pool_scores=(), industry_map=None, regime_by_session=None, cap_by_session=None):
     request = policy["request"]
     start, end = request["research_start"], request["research_end"]
     selected = {d: v for d, v in scores.items() if start <= d <= end}
@@ -274,6 +290,35 @@ def evaluate_candidate(candidate, scores, baseline_scores, snapshot, labels, mar
         e=factor_statistics(subset,proxy,labels,DEFAULT_POLICY,clock)
         exchanges[exchange]={'n':e['diagnostics']['valid_section_count'],'mean_rank_ic':e['diagnostics']['spearman']['mean']}
     screen(e1,request,yearly,exchanges)
+    # E1 单调性诊断（P-20261019 → 2026-10-20 降级为 note-only）：不再作为 pass/reject
+    # 门槛。A 股日频/周频单因子层的分组收益 Spearman 真实量级 ≈0.05~0.1，硬卡（如
+    # spearman≥0.8）会误杀（Patton & Timmermann 2010 JFE 报告单调性检验低信噪比下
+    # 功效仅 11-13%）。改为产出分组收益 + PT MR test 相邻差 p 值，仅作 factor_notes
+    # 里的形状诊断，供多因子合成阶段做相对比较（IC 相近时选单调性更强者）。
+    from .monotonicity import monotonicity_diagnostics, monotonicity_note
+    monotonicity = monotonicity_note(monotonicity_diagnostics(
+        scores, snapshot, labels, clock, start, end,
+        block_length=request["block_length"], alpha=request["alpha"],
+        replicates=request["bootstrap_replicates"]))
+    e1["diagnostics"]["monotonicity"] = monotonicity  # note-only，不影响 decision
+    # 稳健性因子备注（note-only，不参与 pass/reject）：行业/市场状态/市值适用性，
+    # 供多因子合成阶段做条件化限制。行业映射缺省时 best-effort 加载申万映射
+    # （缺失则如实标注 unavailable），regime 标签需外部提供。
+    from .applicability import applicability_notes, default_shenwan_industry_map
+    if industry_map is None:
+        industry_map = default_shenwan_industry_map()
+    if regime_by_session is None:
+        # regime 标签 best-effort 从缓存加载（不触网）；缓存缺失则如实 unavailable。
+        from .regime import default_csi300_regime
+        regime_by_session = default_csi300_regime()
+    if cap_by_session is None:
+        # 市值分段 best-effort 从缓存加载（不触网）；缓存缺失则如实 unavailable。
+        from .cap_data import default_cap_by_session
+        cap_by_session = default_cap_by_session()
+    factor_notes = applicability_notes(scores, snapshot, labels, clock, start, end,
+                                       industry_map=industry_map, regime_by_session=regime_by_session,
+                                       cap_by_session=cap_by_session)
+    factor_notes["monotonicity"] = monotonicity  # note-only 形状诊断，与 regime/cap/industry 并列
     try:
         similarity = paired_scores(scores, baseline_scores, start, end)
         e2 = evaluation("E2", "valid", "independence_description_pending_economic_increment",
@@ -305,7 +350,14 @@ def evaluate_candidate(candidate, scores, baseline_scores, snapshot, labels, mar
         return value
     candidate_account = run_account(ir, market, start=start, end=end)
     baseline_account = baseline_run()
-    e3 = paired_accounts(candidate_account, baseline_account, request)
+    # 2026-10-19: certified historical runs also require absolute excess (CSI300 +
+    # CSI500) whenever the candidate's absolute return is non-positive. Synthetic and
+    # uncertified fixtures keep the historical paired-only decision.
+    enforce_excess = (snapshot.payload.get("exposure") != "synthetic"
+                      and bool(market.get("event_coverage_certified"))
+                      and bool(market.get("tradability_certified")))
+    e3 = paired_accounts(candidate_account, baseline_account, request,
+                         enforce_absolute_excess=enforce_excess)
     if snapshot.payload["exposure"] == "synthetic":
         e3["economic_reward_eligible"] = False
         e3["evidence_scope"] = "diagnostic"
@@ -368,4 +420,5 @@ def evaluate_candidate(candidate, scores, baseline_scores, snapshot, labels, mar
             "candidate_account": candidate_account, "baseline_account": baseline_account,
             "policy_hash": policy["policy_hash"], "snapshot_hash": snapshot.hash,
             "source_scope": snapshot.payload["exposure"],
+            "factor_notes": factor_notes,
             "selection_audit": snapshot.payload.get('provenance',{}).get('selection_audit')}

@@ -17,6 +17,7 @@
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -36,10 +37,27 @@ FALSIFIED_MOTIFS = WORKSPACE / "data" / "fuxi_unified" / "falsified_motifs.json"
 # manual 身份可显式抬升 worker 内存上限（design-sanctioned，见 scripts/ab_ga_ops.py 同款先例）。
 # 八轴须全显式且与 DEFAULT_LIMITS 键集一致；仅 max_memory_mb 2048→8192，其余轴保持默认。
 DAILY_LIMITS = {
-    "max_rounds": 40, "max_candidates": 80, "max_worker_seconds": 300,
-    "max_total_seconds": 28800, "max_memory_mb": 8192,
+    "max_rounds": 40, "max_candidates": 80, "max_worker_seconds": 420,
+    "max_total_seconds": 36000, "max_memory_mb": 8192,
     "max_external_requests": 30, "max_llm_calls": 12, "max_output_tokens": 24000,
 }
+
+
+def parallel_environment(base=None):
+    """M1/M2 speedup for the daily cycle (user-authorized 2026-10-19).
+
+    The 300s→420s worker window plus a 2% overrun tolerance removes the
+    measurement-jitter halt; M1/M2 turn the serial 4-candidate round into a
+    spawn-all/collect-in-proposal-order round (bit-exact A/B per ARCHITECTURE §7).
+    Set FUXI_CYCLE_PARALLEL=0 to fall back to the serial path.
+    """
+    env = dict(os.environ if base is None else base)
+    if env.get("FUXI_CYCLE_PARALLEL", "1") != "0":
+        env.setdefault("FUXI_V1_PARALLEL_CANDIDATES", "1")
+        env.setdefault("FUXI_V1_PERSISTENT_POOL", "1")
+        env.setdefault("FUXI_V1_POOL_SIZE", "4")
+        env.setdefault("FUXI_V1_POOL_MAX_REQUESTS", "40")
+    return env
 
 
 def _now():
@@ -394,7 +412,8 @@ def run_research(snapshot, hypotheses, memory_sources, *, rounds=20, candidates=
     # 原硬编码 3600s 无法覆盖 20×4=80 候选在 1125 截面上的串行运行（实测约 70min）。
     _limits_for_timeout = dict(limits) if limits else dict(DAILY_LIMITS)
     _timeout = int(_limits_for_timeout.get("max_total_seconds", 14400)) + 300
-    result = subprocess.run(cmd, cwd=str(WORKSPACE), capture_output=True, text=True, timeout=_timeout)
+    result = subprocess.run(cmd, cwd=str(WORKSPACE), capture_output=True, text=True, timeout=_timeout,
+                            env=parallel_environment())
     # 成功时 unified_runner 打印 stdout JSON；拒绝/失败时打印 stderr JSON（exit_code=2）
     answer = {}
     for stream in (result.stdout, result.stderr):

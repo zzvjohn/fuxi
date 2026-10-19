@@ -14,6 +14,7 @@ import re
 import sys
 import threading
 import uuid
+from .budgets import budget_units as _budget_units, worker_timeout_seconds as _worker_timeout
 from .contracts import digest, load_json, require, timestamp
 
 
@@ -235,8 +236,8 @@ def validate_native_budget(identity, argv=None):
     require('full_market_options' not in payload, 'unregistered resource option alias')
     full = payload.get('full_market_execution')
     if full is None:
-        native = {'worker_timeout': 300, 'worker_memory_mb': 2048, 'model_timeout': 60,
-                  'portfolio_timeout': 120, 'budget_units': rounds*candidates*300+420}
+        native = {'worker_timeout': _worker_timeout(), 'worker_memory_mb': 2048, 'model_timeout': 60,
+                  'portfolio_timeout': 120, 'budget_units': _budget_units(rounds, candidates)}
     else:
         require(isinstance(full, dict) and set(full) == {'schema_version', 'top_n', 'worker_timeout',
                 'worker_memory_mb', 'model_timeout', 'portfolio_timeout', 'budget_units'}

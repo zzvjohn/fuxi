@@ -3,6 +3,33 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格。
 版本号自 v2.0.0 起与产品名对齐；`v0.7.x` 段为旧伏羲的工程批次账本，两者并行记录。
 
+## [2.1.0] - 2026-10-20
+
+### Added
+- **系统慢循环（慢进化）落地**：`scripts/system_evolve.py`（CLI：observe/draft/freeze/assess/history/promote）
+  与 `research/system_evolution/`（`observe.py` 观测沉淀 + 规则提炼、`scorecard.py` 转正评分卡
+  P 门 7 条 + S 门分类别、`gate.py` 冻结/评估扩展 `case_deltas`）。转正严格锁死人工，
+  其余观测/提炼/挑战者开关/freeze-assess/评分卡全自动。
+- **因子评价 E1 扩展**：`monotonicity.py`（单调性诊断，Patton & Timmermann (2010, JFE) MR test 口径，
+  相邻分组收益差 block bootstrap 单边 p 值，note-only 不设绝对门槛）、`applicability.py`
+  （适用性备注：行业/市场状态/市值分段的条件化 Rank IC）、`regime.py`（沪深300 MA200 牛熊划分）、
+  `cap_data.py`（tushare 历史流通市值序列，代码转换 XSHE/XSHG ↔ SZ/SH）。
+- **组合层风险监控**：`exposure_monitor.py`（行业暴露 + 漂移 + 市值分段）、`factor_family.py`（因子族类归因）。
+- **工程裁决**：`final_admission.py`（E2 池内去冗余，IC 降序贪心入池）、`benchmarks.py`
+  （E3 双基准 CSI300/CSI500，配对增量与绝对超额分开报告）、`budgets.py`（worker 超时 420s、
+  预算单元、2% 容差 overrun 判定）。
+
+### Changed
+- **单调性门降级为诊断备注**：移除 `spearman≥0.8` 绝对门槛（A 股单因子日频不可达，
+  全量 28 个 JQ pass 因子实测 0 通过）；改为 spread 不显著 → `data_insufficient` fail-open，
+  不再翻转 E1 裁决，结果并入 `factor_notes` 与 regime/market_cap/industry 并列。
+- **E3 参照系**：新增沪深300/中证500 双基准，绝对收益≤0 时须双基准超额均>0（仅 certified 快照启用）。
+- **预算提速**：worker 超时 300s→420s（含 2% 容差），编排器默认并行 M1+M2。
+
+### Fixed
+- `residual_rank_ic` / `paired_parent` 的 dict 分支 `clock` 类型错误（datetime vs str 比较）。
+- `gen_15_jq_standalone.py` 科创板 688/689 市价单需保护限价（改限价单 + 保护价缓冲）。
+
 ## [2.0.0] - 2026-10-18
 
 ### Changed

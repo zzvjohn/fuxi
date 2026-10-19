@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+from .budgets import budget_units as _budget_units, worker_timeout_seconds as _worker_timeout
 from .contracts import canonical, canonical_chunks, digest, require, load_json
 from .artifacts import code_manifest, publish, verify
 from .data import Snapshot, Labels
@@ -1009,8 +1010,10 @@ def run_campaign(input_path, output_root, *, rounds=5, candidates_per_round=3, m
                   "llm_enabled": llm_enabled,
                   "llm_max_calls": sum(a in {'llm','llm_patch'} for a in study_protocol['arm_schedule']) if study_protocol else (max(1, rounds // 5) if llm_enabled else 1),
                   "llm_output_token_cap_per_call": 1800,
-                  "model_algorithms": list(model_algorithms), "budget_units": rounds*candidates_per_round*300+420,
-                  "budget_unit": "reserved_worker_wall_seconds", "worker_memory_mb": 2048, "worker_timeout": 300,
+                  "model_algorithms": list(model_algorithms),
+                  "budget_units": _budget_units(rounds, candidates_per_round),
+                  "budget_unit": "reserved_worker_wall_seconds", "worker_memory_mb": 2048,
+                  "worker_timeout": _worker_timeout(),
                   "data_scope": scope_of(snapshot), "history_exposure_inherited": snapshot.payload["exposure"]}
         if full_options is not None:
             config.update(full_market_execution=full_options,
@@ -1523,6 +1526,18 @@ def run_campaign(input_path, output_root, *, rounds=5, candidates_per_round=3, m
                 checkpoints.append(check)
             print(json.dumps({"campaign_id": campaign_id, **row}, ensure_ascii=False), flush=True)
         require(code_manifest() == code, "code changed mid-campaign; evidence needs a new code identity")
+        # 2026-10-19: canonical final JQ admission. The per-candidate flag is
+        # settle-order dependent (E2 is greedy); this deterministic IC-descending
+        # pass is what the delivery bundles and the daily report must agree on.
+        try:
+            from .final_admission import canonical_final_admission
+            final_admission = (canonical_final_admission(results, candidates_all, snapshot, labels,
+                                                         payload["research_clock"], request, top_n=top_n)
+                               if results else {"rule": None, "members": [], "accepted_count": 0,
+                                                "eligible_count": 0, "accepted_ids": []})
+        except Exception as exc:  # never lose the campaign because the pass failed
+            final_admission = {"rule": "unavailable", "reason": f"{type(exc).__name__}: {exc}",
+                               "members": [], "accepted_count": None, "eligible_count": 0, "accepted_ids": []}
         if full_options is not None:
             from .columnar import selected_by_dates
             selected_before = selected_by_dates(baseline_scores, request["calibration_start"], request["calibration_end"])
@@ -1535,7 +1550,11 @@ def run_campaign(input_path, output_root, *, rounds=5, candidates_per_round=3, m
                   "attempted_candidates": len(results), "engineering_errors": sum(r["eval_status"] == "error" for r in results),
                   "valid_descriptive_factors": sum(r["valid_e1"] for r in results),
                   "formal_account_valid": sum(r["formal_account_valid"] for r in results),
-                  "jq_candidate_count": sum(r["jq_candidate_allowed"] for r in results), "external_jq_runs": 0,
+                  "jq_candidate_count": (final_admission.get("accepted_count")
+                                         if final_admission.get("accepted_count") is not None
+                                         else sum(r["jq_candidate_allowed"] for r in results)),
+                  "jq_candidate_count_provisional": sum(r["jq_candidate_allowed"] for r in results),
+                  "final_admission": final_admission, "external_jq_runs": 0,
                   "economic_reward_count": len(database.effective_rewards("economic")),
                   "capability_reward_count": len(database.effective_rewards("capability")),
                   "pareto_archive": pareto_archive(archive), "policy": policy, "input_hash": config["input_hash"],
@@ -1557,6 +1576,8 @@ def run_campaign(input_path, output_root, *, rounds=5, candidates_per_round=3, m
             report["memory_source_bindings"] = memory_bindings
             report["imported_feedback_counts"] = [p.get("imported_feedback_count", 0)
                                                 for _, p in database.facts("research_decision")]
+        if final_admission.get("members"):
+            database.append("final_admission", final_admission, campaign_id + ":final_admission")
         final_id = database.append("campaign_report", report)
         database.db.execute("UPDATE campaigns SET status=? WHERE id=?", (report['status'],campaign_id))
         state_id = "scheduler_"+digest([campaign_id, final_id])

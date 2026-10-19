@@ -23,8 +23,8 @@ MANUAL = {'single_writer_confirmed': True, 'current_mode': 'controlled_manual',
 BOUNDED = {'single_writer_confirmed': True, 'current_mode': 'bounded_research',
            'autonomous_writes_enabled': True, 'bounded_research': {
     'allowed_actions': sorted(SAFE_AUTOMATIC_ACTIONS),
-    'budgets': {'max_rounds': 3, 'max_candidates': 6, 'max_worker_seconds': 120,
-               'max_total_seconds': 1800, 'max_memory_mb': 2048, 'max_external_requests': 0,
+    'budgets': {'max_rounds': 3, 'max_candidates': 6, 'max_worker_seconds': 420,
+               'max_total_seconds': 6000, 'max_memory_mb': 2048, 'max_external_requests': 0,
                'max_llm_calls': 0, 'max_output_tokens': 0},
     'authorization': {'authorized': True, 'source': 'isolated fixture authorization',
                       'recorded_at': '2026-10-09T20:00:00+08:00'}}}
