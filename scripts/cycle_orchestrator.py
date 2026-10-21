@@ -37,8 +37,8 @@ FALSIFIED_MOTIFS = WORKSPACE / "data" / "fuxi_unified" / "falsified_motifs.json"
 # manual 身份可显式抬升 worker 内存上限（design-sanctioned，见 scripts/ab_ga_ops.py 同款先例）。
 # 八轴须全显式且与 DEFAULT_LIMITS 键集一致；仅 max_memory_mb 2048→8192，其余轴保持默认。
 DAILY_LIMITS = {
-    "max_rounds": 40, "max_candidates": 80, "max_worker_seconds": 420,
-    "max_total_seconds": 36000, "max_memory_mb": 8192,
+    "max_rounds": 40, "max_candidates": 80, "max_worker_seconds": 600,
+    "max_total_seconds": 50000, "max_memory_mb": 8192,
     "max_external_requests": 30, "max_llm_calls": 12, "max_output_tokens": 24000,
 }
 
@@ -46,7 +46,7 @@ DAILY_LIMITS = {
 def parallel_environment(base=None):
     """M1/M2 speedup for the daily cycle (user-authorized 2026-10-19).
 
-    The 300s→420s worker window plus a 2% overrun tolerance removes the
+    The 300s→420s→600s worker window plus a 2% overrun tolerance removes the
     measurement-jitter halt; M1/M2 turn the serial 4-candidate round into a
     spawn-all/collect-in-proposal-order round (bit-exact A/B per ARCHITECTURE §7).
     Set FUXI_CYCLE_PARALLEL=0 to fall back to the serial path.

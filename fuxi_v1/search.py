@@ -9,6 +9,7 @@ import time
 import urllib.request
 from .contracts import digest, require, keys, ContractError
 from .dsl import CATALOG, compile_ast
+from .types_core.rules import render_for_prompt
 
 
 def node(op, *args, window=None):
@@ -176,7 +177,7 @@ def factor_spec(ast, fields, mechanism, *, parent_ids=(), action="template", sou
 
 def generate(fields, *, arm, count, seed, parents=(), seen=(), diagnostics=None, counters=None,
              regime_profiles=None, shuffle_source=False):
-    require(arm in {"fixed", "random", "refine", "combine", "random_ast", "regime_combine"},
+    require(arm in {"fixed", "random", "refine", "combine", "random_ast", "regime_combine", "gflownet"},
             "unknown local generator")
     gen_expand = os.environ.get("FUXI_V1_GEN_EXPAND", "legacy")
     require(gen_expand in {"legacy", "expanded"}, "unknown generator expansion mode")
@@ -287,11 +288,17 @@ def generate(fields, *, arm, count, seed, parents=(), seen=(), diagnostics=None,
             propose(node("add", node("rank", a["canonical_ast"]), node("rank", b["canonical_ast"])),
                 "combined_independent_hypotheses", parent_ids=[a["candidate_id"], b["candidate_id"]],
                 action="combine_candidates", mutation={"axis": "combination", "operator": "add_rank"})
+    if arm == "gflownet":
+        # GFlowNet 生产臂（第 6 臂）：生产 DSL 空间的离散采样 + 类型掩码（types_core），
+        # 产出生产 AST 走 factor_spec -> compile_ast -> E0-E5。独立采样臂，不掺模板 filler。
+        from .gflownet_arm import sample_asts
+        for ast in sample_asts(fields, count=count, seed=seed):
+            propose(ast, "gflownet_discrete_structure", action="gflownet_generate")
     # Fallback is explicit in action metadata; unsupported refinement does not pretend it ran.
     # The typed random-null arm stays pure: templates are not part of its population.
     # regime_combine proposes complementary pairs only; template filler is the
     # campaign's explicit fallback (mirroring the LLM arm), never a silent co-proposal.
-    if arm not in ("random_ast", "regime_combine"):
+    if arm not in ("random_ast", "regime_combine", "gflownet"):
         for mechanism, ast in source:
             propose(ast, mechanism, action="fixed_template" if arm == "fixed" else "typed_random_template")
     result, known = [], set(seen)
@@ -332,7 +339,8 @@ def llm_candidates(fields, evidence_cards, *, count=3, max_tokens=1800, timeout=
                                "time_example": {"op": "return", "args": [{"field": "close"}], "window": 5},
                                "binary_example": {"op": "sub", "args": [{"op": "rank", "args": [{"field": "close"}]},
                                                                  {"op": "rank", "args": [{"field": "volume"}]}]},
-                               "rules": "Operator objects have op,args and window only for time operators. Field leaves have field only. No numeric literals. add/sub require same units; rank produces dimensionless output. Time operators take exactly one FIELD LEAF, never a nested expression."},
+                               "rules": ("Operator objects have op,args and window only for time operators. Field leaves have field only. No numeric literals. "
+                                         + render_for_prompt())},
               "evidence": evidence_cards,
               "external_hypotheses": [{"mechanism": h.get("mechanism", ""), "direction": h.get("direction"),
                                         "source": h.get("source", "")} for h in external_hypotheses],

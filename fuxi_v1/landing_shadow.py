@@ -22,10 +22,12 @@ PRODUCTION_ARM_TO_V2 = {
     "regime_combine": "C_combine",
     "llm": "D_knowledge",
     "random": "E_explore",
+    "random_ast": "E_explore",
+    "gflownet": "E_explore",
 }
 
 # Production emitter set covered by the mapping (completeness is asserted in tests).
-PRODUCTION_ARMS = ("fixed", "random", "refine", "combine", "regime_combine", "llm")
+PRODUCTION_ARMS = ("fixed", "random", "random_ast", "refine", "combine", "regime_combine", "gflownet", "llm")
 
 
 def p5_shadow_mode():

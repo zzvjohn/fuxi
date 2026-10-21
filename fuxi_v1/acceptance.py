@@ -53,6 +53,11 @@ class AcceptanceService:
                 "investment_certification": investment_certification,
                 "jq_candidate_allowed": not blockers, "live_execution_allowed": False,
                 "checked_at": now(), "E5_required_for_first_JQ": False}
+        # G6 注册元数据补类型（note-only 审计）：FUXI_TYPE_NOTES=on 时携带 output_type，
+        # 前瞻期可按 family 追踪过拟合分布。off 时不加（保持注册 body 逐位不变）。
+        output_type = result.get("factor_notes", {}).get("output_type")
+        if output_type is not None:
+            body["output_type"] = output_type
         evidence_id = self.store.append("research_admission", body)
         body["receipt_id"] = self.store.receipt("research_acceptance", {**body, "evidence_id": evidence_id}) if not blockers else None
         return body

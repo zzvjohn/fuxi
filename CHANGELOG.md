@@ -3,6 +3,44 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格。
 版本号自 v2.0.0 起与产品名对齐；`v0.7.x` 段为旧伏羲的工程批次账本，两者并行记录。
 
+## [2.2.0] - 2026-10-21
+
+### Added
+- **量纲语法系统 `types_core/`**（2026-10-21 引入，量纲 + 语义分层类型）：
+  `spec.py`（TypeSpec + 量纲指数代数 + UNIT_DIMENSIONS 单点）、`registry.py`（字段级 10 + 因子级 97 显式注册 +
+  名称模式推断 + resolve 四级解析）、`rules.py`（算子规则三档 hard/soft/open + 违规码 + render_for_prompt）、
+  `infer.py`（双前端推断 + TypeState 增量状态 + mask_actions 动作掩码）。纯 stdlib，零 fuxi_v1 内部依赖，
+  与 factor_mining 两侧复用同一规则表。接线点 W1-W4 均带独立 env 开关（默认 off = 逐位不变）：
+  `FUXI_TYPE_GATE` / `FUXI_TYPE_GROUPS` / `FUXI_TYPE_MASK` / `FUXI_TYPE_NOTES` / `FUXI_TYPE_SOFT_PENALTY` /
+  `FUXI_TYPES_OVERRIDE`。
+- **GFlowNet 生产臂（第 6 臂）**：`gflownet_arm.py` + `gflownet_policy.py`，把 factor_mining 沙箱里的
+  GFlowNet 提升为生产 fuxi_v1 的一臂，输出生产 DSL 空间的 AST（叶子 = `{"field": name}`、算子 = 生产
+  CATALOG 非时序算子），走与 fixed/refine/combine 相同的 `search.factor_spec → compile_ast → E0-E5` 链路。
+  采样侧用 TypeState + mask_actions（同一 rules 规则表），产出侧走 compile_ast 的 UNITS 量纲 +
+  FUXI_TYPE_GATE 兜底。UCB 接线：scheduler.choose（selection_v2）+ campaign.choose_arm（legacy）+
+  campaign study_protocol + landing_shadow.PRODUCTION_ARM_TO_V2（映射到 E_explore）。
+- **旁挂方法库 `factor_mining/`**（2026-10-20 引入）：两目标 NSGA-II 组合层（nsga2_biobjective）+
+  GFlowNet 因子表达式生成器（gflownet/）+ E 道移植复评（e_channel）+ JQ 回测代码（jq_backtests/）。
+  独立于 fuxi_v1 治理链，可被每日自动化 `import` 或 `python -m` 调用。
+
+### Changed
+- **预算提速**：`DEFAULT_WORKER_TIMEOUT_SECONDS` 420→600s（LLM 臂单候选 ~410-440s，600s 留 160-190s 余量）；
+  `DEFAULT_LIMITS.max_worker_seconds` 同步 420→600，`max_total_seconds` 36000→50000。
+- **L2 prompt 规则同源**：`search.llm_candidates` 的手写 rules 字符串改为 `render_for_prompt()` 拼接
+  （消灭 C3 手工副本漂移）。
+- **G6 注册携带 output_type**：`acceptance.research` 的 body 在 FUXI_TYPE_NOTES=on 且 output_type 非 None 时
+  加 output_type 字段（off 时 body 逐位不变，A/A 安全）。
+- **G3 family 冗余诊断**：`research_evaluation.pool_redundancy` 加 candidate_ast 参数 + `_semantic_redundancy_note()`
+  （FUXI_TYPE_NOTES=on 时产出，同 family + 相关>0.7 标注 redundancy_semantic，仅诊断不升门控）。
+- **W2 GA 变异升 type_groups**：`ga_ops.type_groups_enabled()` + `_group_key`（FUXI_TYPE_GROUPS=on 时按
+  TypeSpec (dim,form) 分组，off 时按 unit 分组，原行为逐位不变）。
+
+### Fixed
+- `test_generator_bounds.test_valid_deep_parents_reject_oversized_child_and_fall_back` 断言改为
+  `counters['compiler_rejected']>=1`（GA 路径 combine_ga 写 counters，非 legacy combine 的 diagnostics 死代码）。
+- `landing_shadow.PRODUCTION_ARM_TO_V2` 补 `random_ast → E_explore`（legacy 默认路径臂序用 random_ast，
+  但原映射只有 random，导致 P5 shadow 冷启动 round 1 每回合落 landing_shadow_error）。
+
 ## [2.1.0] - 2026-10-20
 
 ### Added

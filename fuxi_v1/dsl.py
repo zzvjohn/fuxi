@@ -16,6 +16,9 @@ CATALOG = {
     "time": "explicit session calendar; field leaves only; available_at<=decision_time",
     "missing": "propagate; div zero=>missing; complete mean window required",
 }
+# C2 软收敛：量纲格真值源 = types_core.spec.UNIT_DIMENSIONS（单点）。
+# 本处保留硬编码是因为 jq.py.compile_diagnostic 会把 dsl.py 源码内联（过滤 `from .`
+# 相对导入），dsl.py 必须内联自包含、不能依赖 types_core 包。改量纲格时两处同步改。
 UNITS = {"price": (1, 0), "shares": (0, 1), "ratio": (0, 0), "currency": (1, 1)}
 
 
@@ -90,6 +93,27 @@ def _score_stats(snapshot, cache):
     return stats
 
 
+# ---------------------------------------------------------------- 类型闸门（P1，2026-10-21）
+# FUXI_TYPE_GATE=on 时，compile_ast 在既有 UNITS 量纲校验之外，额外跑 types_core 的
+# 语义类型检查（check_tree），hard 违规即拒绝——把"语义垃圾"（add(score, price) 等）
+# 前置到编译期，省去最贵的评估预算。off（默认）时逐位不变（A/A 纪律）。
+# 依赖 types_core（纯 stdlib），函数内延迟 import，避免与 search/ga_ops 的模块级循环。
+
+def type_gate_enabled():
+    mode = os.environ.get("FUXI_TYPE_GATE", "off")
+    require(mode in {"off", "on"}, "unknown type gate mode")
+    return mode == "on"
+
+
+def _type_gate_hard_violations(ast, fields):
+    """gate=on 时返回 hard 违规列表（空 = 通过）。gate=off 恒返回 []。"""
+    if not type_gate_enabled():
+        return []
+    from .types_core import check_tree, hard_violations, resolve
+    resolver = lambda name: resolve(name, kind="field")
+    return hard_violations(check_tree(ast, resolver))
+
+
 def compile_ast(ast, fields):
     count = 0
     required_fields = set()
@@ -130,6 +154,9 @@ def compile_ast(ast, fields):
             unit = tuple(a + sign * b for a, b in zip(units[0], units[1]))
         return unit, max(lookbacks)
     unit, lookback = walk(ast, 1)
+    # P1 类型闸门：gate=on 时语义垃圾在此拒绝（off 时 _type_gate_hard_violations 恒空）。
+    hard = _type_gate_hard_violations(ast, fields)
+    require(not hard, "type gate rejected: " + "; ".join(f"{v.code}:{v.detail}" for v in hard[:3]))
     return dict(formula_hash=digest(ast), catalog_hash=digest(CATALOG),
                 required_fields=sorted(required_fields), output_unit=list(unit),
                 lookback=lookback, node_count=count)

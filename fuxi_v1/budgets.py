@@ -5,6 +5,11 @@
 the parent-measured settlement could exceed the reservation by <1s, which used
 to poison the campaign permanently (``campaigns.status='budget_overrun'``).
 
+2026-10-20 (user-authorized): raised again to 600s after the round-4 halt at
+429.7s/438.9s against the 428.4s tolerance. The LLM arm evaluates one candidate
+in ~410-440s, which sits at the edge of the 420s window; 600s gives ~160-190s
+of headroom. FIXED_OVERHEAD_SECONDS stays 420 (independent one-time settle buffer).
+
 Two numbers must stay consistent wherever they are consumed:
   * ``worker_timeout_seconds()`` — the actual per-attempt wall clock;
   * ``budget_units(rounds, candidates)`` — the reservation the campaign freezes.
@@ -15,7 +20,7 @@ campaign still stops when cumulative spend exceeds ``budget_units``.
 """
 import os
 
-DEFAULT_WORKER_TIMEOUT_SECONDS = 420
+DEFAULT_WORKER_TIMEOUT_SECONDS = 600
 MIN_WORKER_TIMEOUT_SECONDS = 120
 FIXED_OVERHEAD_SECONDS = 420
 OVERRUN_TOLERANCE = 0.02

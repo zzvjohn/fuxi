@@ -27,6 +27,11 @@ def ga_ops_enabled():
     return os.environ.get("FUXI_V1_GA_OPS", "on") == "on"
 
 
+def type_groups_enabled():
+    """W2：FUXI_TYPE_GROUPS=on 时 GA 变异按 TypeSpec (dim,form) 分组（而非 unit）。"""
+    return os.environ.get("FUXI_TYPE_GROUPS", "off") == "on"
+
+
 # ---------------------------------------------------------------- 预算常量
 # P-20261017: 代数/种群预算从量化因子研究的统计约束反推，不拍脑袋。
 # E1 用 alpha/max_trials 的 bootstrap 区间下界 > 0（research_protocol.screen），
@@ -62,9 +67,20 @@ def _enumerate_refine_edits(parent, fields, rng, per_kind=2):
     from .archetypes import field_family
 
     pid = parent["candidate_id"]
-    unit_groups = {}
-    for name, meta in fields.items():
-        unit_groups.setdefault(meta.get("unit"), []).append(name)
+    # W2: FUXI_TYPE_GROUPS=on 时按 TypeSpec (dim,form) 分组（volume=flow vs float_shares=level
+    # 不再互换成垃圾）；off 时按 unit 分组（原行为，逐位不变）。
+    if type_groups_enabled():
+        from .types_core import resolve
+
+        def _group_key(name):
+            ts = resolve(name, kind="field")
+            return (ts.dim, ts.form)
+    else:
+        def _group_key(name):
+            return fields[name].get("unit")
+    groups = {}
+    for name in fields:
+        groups.setdefault(_group_key(name), []).append(name)
     cross, same = [], []
     temporal_ops = {"lag", "return", "mean", "std", "min", "max", "delta"}
     for path, target in paths(parent["canonical_ast"]):
@@ -74,8 +90,8 @@ def _enumerate_refine_edits(parent, fields, rng, per_kind=2):
             for w in neighbors:
                 same.append({"parent_id": pid, "kind": "window", "path": list(path), "value": w})
         elif "field" in target:
-            unit = fields[target["field"]].get("unit")
-            alternatives = [f for f in unit_groups.get(unit, []) if f != target["field"]]
+            key = _group_key(target["field"])
+            alternatives = [f for f in groups.get(key, []) if f != target["field"]]
             for f in rng.sample(alternatives, min(per_kind, len(alternatives))):
                 bucket = cross if field_family(f) != field_family(target["field"]) else same
                 bucket.append({"parent_id": pid, "kind": "field", "path": list(path), "value": f})

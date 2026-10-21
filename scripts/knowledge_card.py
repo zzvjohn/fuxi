@@ -26,10 +26,15 @@ import argparse
 import hashlib
 import json
 import sys
+from collections import Counter
 from datetime import datetime, date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from fuxi_v1.archetypes import archetype_of, load_archetypes
 STORE = ROOT / "data" / "knowledge_cards.json"
 PROPOSALS = ROOT / "data" / "stage1_factor_proposals.json"
 SCHEMA = "fuxi.knowledge_card.1"
@@ -40,6 +45,103 @@ REPLICATION = ("not_replicated", "replicated", "failed", "unknown")
 DIRECTIONS = (1, -1)
 DIRECTION_ALIASES = {1: 1, -1: -1, "1": 1, "-1": -1,
                      "positive": 1, "negative": -1}
+
+# ------------------------------------------------------------------ 卡片 archetype
+# 卡层把全局 24 archetype 中的「fundamental」细分为 6 个亚族（Fama-French 5 因子
+# + 质量/成长），用于跨族配额与分布可视化；全局 24 archetype（campaign 层 HHI 预算
+# 使用）保持不动。卡片 archetype 值域 = 24 全局族 ∪ 下面 6 个 fundamental 亚族。
+FUNDAMENTAL_SUB_ZH = {
+    "value": "价值(估值)", "quality": "质量(盈利质量)", "growth": "成长",
+    "size": "规模", "profitability": "盈利", "investment": "投资",
+}
+
+
+def _refine_fundamental(formula, text):
+    """fundamental 卡细分为 6 亚族（formula 字段精确优先，rationale 关键词兜底）。
+
+    顺序敏感：先判最特异性字段（log(市值)=规模、asset_growth=投资、
+    operating_profitability=盈利、shift/rd=成长、total_debt=杠杆质量），
+    再判估值/质量字段。total_debt 须先于 total_equity（杠杆 vs 账面市值比）。
+    """
+    f = (formula or "").lower()
+    if "log(market_cap)" in f or "log market_cap" in f:
+        return "size"
+    if "asset_growth" in f:
+        return "investment"
+    if "operating_profitability" in f:
+        return "profitability"
+    if "rd_expense" in f or ("shift" in f and ("revenue" in f or "net_income" in f)):
+        return "growth"
+    if "total_debt" in f:
+        return "quality"  # 杠杆率：先于 total_equity 判，避免误入价值族
+    if any(t in f for t in ("pb", "ps_ttm", "book_to_market", "dividend", "ncav",
+                            "current_assets", "total_equity")):
+        return "value"
+    if any(t in f for t in ("cash", "accrual", "capex",
+                            "operating_cash_flow", "total_assets", "operating_income")):
+        return "quality"
+    t = (text or "").lower()
+    if any(k in t for k in ("价值", "估值", "便宜", "股息", "净净")):
+        return "value"
+    if any(k in t for k in ("成长", "增速", "增长", "研发")):
+        return "growth"
+    if any(k in t for k in ("盈利", "利润", "质量", "现金流", "杠杆", "应计")):
+        return "quality"
+    if any(k in t for k in ("规模", "市值")):
+        return "size"
+    return "fundamental"
+
+
+def classify_card(card):
+    """卡片 → archetype（卡层扩充口径：fundamental 细分为 6 亚族）。
+
+    公式优先（字段精确，最可靠）：先 fundamental 亚族，再量价（volume/amount/corr）。
+    仅当公式无信号时退回语义关键词（title + economic_rationale），处理
+    反转/动量/事件等无独有字段的族。语义匹配仍可能因英文标题/中文理由碰撞，
+    故不作为首选。
+    """
+    source = card.get("source") or {}
+    mechanism = card.get("mechanism") or {}
+    title = source.get("title") or ""
+    rationale = mechanism.get("economic_rationale") or ""
+    formula = str(mechanism.get("formula_pandas") or "")
+    # 1. formula-first：fundamental 亚族
+    sub = _refine_fundamental(formula, rationale)
+    if sub != "fundamental":
+        return sub
+    # 2. formula-first：量价
+    f = formula.lower()
+    if any(t in f for t in ("volume", "amount", "corr")):
+        return "price_volume"
+    # 3. 语义兜底：24-archetype 关键词
+    archetypes, unclassified = load_archetypes()
+    return archetype_of({"label": title, "economic_rationale": rationale, "paradigm": ""},
+                        archetypes, unclassified)
+
+
+def archetype_zh(arch):
+    if arch in FUNDAMENTAL_SUB_ZH:
+        return FUNDAMENTAL_SUB_ZH[arch]
+    archetypes, unclassified = load_archetypes()
+    zh = {a["id"]: a["zh"] for a in archetypes}
+    zh[unclassified] = "未分类"
+    return zh.get(arch, arch)
+
+
+def _family_counts(store, proposals):
+    """card 派生提案按 archetype 计数（提案缺 archetype 时回查卡片）。"""
+    cnt = Counter()
+    card_by_id = {c.get("card_id"): c for c in store["cards"]}
+    for p in proposals:
+        if p.get("source_proposal") != "KNOWLEDGE-CARD":
+            continue
+        arch = p.get("archetype")
+        if arch is None:
+            card = card_by_id.get(p.get("knowledge_card_id"))
+            arch = (card or {}).get("archetype")
+        if arch:
+            cnt[arch] += 1
+    return cnt
 
 
 def _norm_direction(value):
@@ -162,6 +264,7 @@ def cmd_add(args):
             continue
         cid = card_id(card)
         card["card_id"] = cid
+        card["archetype"] = classify_card(card)
         card.setdefault("derived_proposals", [])
         if cid in existing:
             skipped.append(cid)
@@ -190,14 +293,35 @@ def cmd_list(args):
         needle = args.source.lower()
         rows = [c for c in rows
                 if needle in str((c.get("source") or {}).get("title", "")).lower()]
+    if args.by_archetype:
+        return _list_by_archetype(rows)
     summary = [{"card_id": c.get("card_id"),
                 "title": (c.get("source") or {}).get("title", "")[:60],
                 "market": (c.get("scope") or {}).get("market"),
                 "state": (c.get("local_status") or {}).get("state"),
                 "available_at": c.get("knowledge_available_at"),
+                "archetype": c.get("archetype"),
+                "archetype_zh": archetype_zh(c.get("archetype")),
                 "derived": len(c.get("derived_proposals") or [])} for c in rows]
     print(json.dumps({"count": len(summary), "cards": summary},
                      ensure_ascii=False, indent=2))
+    return 0
+
+
+def _list_by_archetype(rows):
+    cnt = Counter(c.get("archetype") or "unclassified" for c in rows)
+    lowvol = cnt.get("volatility", 0)
+    reversal = cnt.get("reversal", 0)
+    dist = [{"archetype": a, "zh": archetype_zh(a), "count": n}
+            for a, n in cnt.most_common()]
+    print(json.dumps({
+        "count": len(rows),
+        "distribution": dist,
+        "volatility_low_vol_count": lowvol,
+        "reversal_count": reversal,
+        "low_vol_or_reversal_total": lowvol + reversal,
+        "low_vol_or_reversal_ratio": round((lowvol + reversal) / len(rows), 4) if rows else 0.0,
+    }, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -217,6 +341,18 @@ def cmd_promote(args):
 
     proposals = _read(PROPOSALS, {"proposals": []})
     rows = proposals.setdefault("proposals", [])
+    card_arch = card.get("archetype") or classify_card(card)
+    # 跨族配额：card 派生候选按 archetype 计数，防止单族泛滥（低波/反转簇集中）。
+    if args.max_per_family is not None and args.max_per_family > 0:
+        counts = _family_counts(store, rows)
+        cur = counts.get(card_arch, 0)
+        if cur >= args.max_per_family:
+            print(json.dumps({"status": "quota_blocked",
+                              "archetype": card_arch, "archetype_zh": archetype_zh(card_arch),
+                              "family_count": cur, "max_per_family": args.max_per_family,
+                              "reason": "该族已派生 %d 个候选，达跨族配额上限 %d" % (cur, args.max_per_family)},
+                             ensure_ascii=False, indent=2))
+            return 0
     name = args.name or ("kc_" + card["card_id"].split("_", 1)[1])
     taken = {str(p.get("factor_name")) for p in rows} | \
             {str(p.get("formula_pandas")) for p in rows}
@@ -236,6 +372,7 @@ def cmd_promote(args):
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "knowledge_card_id": card["card_id"],
         "knowledge_available_at": card.get("knowledge_available_at"),
+        "archetype": card_arch,
     }
     if args.dry_run:
         print(json.dumps({"status": "dry_run", "would_write": proposal},
@@ -248,6 +385,23 @@ def cmd_promote(args):
     card.setdefault("local_status", {})["state"] = "unverified"
     _write(STORE, store)
     print(json.dumps({"status": "promoted", "factor_name": name, "card_id": card["card_id"]},
+                     ensure_ascii=False))
+    return 0
+
+
+def cmd_reclassify(args):
+    """回填/重算所有卡片的 archetype 字段（append-only 库的字段补齐迁移）。"""
+    store = load_store()
+    changed = 0
+    for card in store["cards"]:
+        arch = classify_card(card)
+        if card.get("archetype") != arch:
+            card["archetype"] = arch
+            changed += 1
+    if changed:
+        store["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        _write(STORE, store)
+    print(json.dumps({"status": "ok", "changed": changed, "total": len(store["cards"])},
                      ensure_ascii=False))
     return 0
 
@@ -286,14 +440,21 @@ def main():
     ls.add_argument("--state", choices=STATES)
     ls.add_argument("--market")
     ls.add_argument("--source")
+    ls.add_argument("--by-archetype", action="store_true",
+                    help="输出 archetype 分布（含低波/反转聚焦计数）")
     ls.set_defaults(func=cmd_list)
 
     promote = sub.add_parser("promote", help="卡片派生为候选写入 stage1_factor_proposals")
     promote.add_argument("--id", required=True)
     promote.add_argument("--name", help="factor_name，默认 kc_<digest>")
     promote.add_argument("--paradigm", help="覆盖 paradigm 标签")
+    promote.add_argument("--max-per-family", type=int, default=3,
+                         help="跨族配额：同 archetype 已派生候选数上限（0=不设限，默认 3）")
     promote.add_argument("--dry-run", action="store_true")
     promote.set_defaults(func=cmd_promote)
+
+    reclassify = sub.add_parser("reclassify", help="回填/重算卡片 archetype 字段")
+    reclassify.set_defaults(func=cmd_reclassify)
 
     verify = sub.add_parser("verify", help="全库格式校验")
     verify.set_defaults(func=cmd_verify)

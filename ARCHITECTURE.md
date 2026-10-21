@@ -149,7 +149,7 @@ external_hypotheses → campaign
 | `calibration.py` | 随机零假设校准（`random_population`） |
 | `models.py` | 可选模型算法（ridge 等），与因子评估解耦 |
 
-四个臂的语义：
+六个臂的语义（GFlowNet 为第 6 臂，2026-10-21 起进入 UCB）：
 
 | 臂 | 行为 |
 |---|---|
@@ -157,8 +157,87 @@ external_hypotheses → campaign
 | `random_ast` | 完整合法空间的随机探索 + 零假设校准 |
 | `refine` | 对 parents 做局部变异（GA 时为六类有界变异） |
 | `combine` | 组合两个 parents（GA 时为多算子 + 子树交叉） |
+| `gflownet` | GFlowNet 离散结构采样（生产 DSL 空间 + 类型掩码，见 §3.4.0） |
+| `llm` | 外部 LLM 假设（可选，末位） |
 
 **基因算子开关**：`FUXI_V1_GA_OPS`（默认 `on`，`off` 可回退旧单叶变异/固定 `add_rank`）。
+
+#### 3.4.0 GFlowNet 生产臂（第 6 臂，2026-10-21 引入）
+
+`gflownet_arm.py` + `gflownet_policy.py`：把 factor_mining 沙箱里的 GFlowNet 提升为生产
+`fuxi_v1` 的一臂，输出**生产 DSL 空间的 AST**（叶子 = `{"field": name}`、算子 = 生产
+CATALOG 算子），走与 `fixed/refine/combine` 完全相同的 `search.factor_spec → compile_ast → E0-E5` 链路。
+
+| 组件 | 职责 |
+|---|---|
+| `gflownet_arm.py::ProdGrammar` | 生产字段叶子（动态取 `fields.keys()`）+ 非时序算子（`add/sub/mul/div` + `neg/rank/zscore/abs/square/log`）的槽位驱动 preorder 语法 |
+| `gflownet_arm.py::sample_asts` | 唯一 AST 采样（无 policy = 类型化随机，有 policy = 按前向策略） |
+| `gflownet_arm.py::train_prod_gflownet` | 离线训练入口（lazy import torch），TB 损失 + 生产 `factor_statistics` reward |
+| `gflownet_policy.py::GFlowNetPolicy` | 自包含前向策略 `P_F(a|s)=softmax(GRU+掩码)`，避免生产侧依赖 factor_mining |
+
+**与量纲语法系统（types_core）的契合**：采样侧用 `TypeState + mask_actions`（同一 rules 规则表，
+add/sub 跨 form/dim 硬拒、div 分母 signed 硬拒、log 非无量纲/非正硬拒），产出侧走 `compile_ast` 的
+UNITS 量纲 + `FUXI_TYPE_GATE` 类型闸门兜底，两侧同源不漂移（R5 治理核心）。
+
+**UCB 接线**（两条生产路径均含 `gflownet`）：`scheduler.choose()`（selection_v2）+ `campaign.choose_arm()`
+（legacy）+ `campaign` study_protocol 允许集 + `landing_shadow.PRODUCTION_ARM_TO_V2`（映射到 `E_explore`）。
+
+🔴 **类型掩码纪律**：`TypeState` 是单条轨迹状态机，每条采样轨迹必须 `reset()`；掩码为空 = 轨迹死胡同 →
+拒绝重采，**绝不回退到未掩码动作集**（否则 add/sub 跨量纲漏过）。修复后 5 种子 `count=20` 全 20/20 可编译。
+
+⚠️ **当前状态**：无训练 policy 时 = 类型化随机采样（generate 主路径零 torch 依赖，设计意图）；
+`train_prod_gflownet` 是离线训练入口，policy 载入热路径属独立后续项。
+
+#### 3.4.1 旁挂方法库 `factor_mining/`（2026-10-20 引入，不改搜索层源码）
+
+独立于 `fuxi_v1` 治理链的**多样性/组合补充工具**，可被每日自动化 `import` 或 `python -m` 调用：
+
+| 模块 | 作用 | 与 v2.0 的关系 |
+|---|---|---|
+| `factor_mining.nsga2_biobjective` | 两目标 NSGA-II **组合层**（收益=`|ic_mean|` 主导复合 + 换手），从 97 因子池选 ≤4 个做 rank 加权组合，产出收益-换手 Pareto 前沿 | 补充 v2.0 缺失的「多因子加权组合」能力 |
+| `factor_mining.gflownet` | GFlowNet 因子表达式生成器（TB 损失 + GRU），产出多样化表达式候选 | `search.generate` LLM 臂/探索臂旁的**多样性补充**，不替代有界 GA |
+
+调用入口：`python -m factor_mining {nsga2|gflownet|compare}`。数据源默认
+`research/factor_alchemy/output/{factor_cache,forward_returns}.pkl`，可用
+`FUXI_FACTOR_CACHE` / `FUXI_FORWARD_RETURNS` 环境变量覆盖。
+
+🔴 **方法论铁律（实验实证，防回归）**：比值型指标（ICIR=ic_mean/ic_std、Sharpe、信息比）
+**只能做验收/筛选，不能做搜索目标**——优化器可操纵分母构造 `std→0` 伪信号。
+搜索目标用分子型 `ic_mean`（= Spearman rank IC mean）。本框架 `pareto_archive` 的
+`quality = e1.diagnostics.spearman.mean` 已是该口径 ✅；两目标 NSGA-II 的收益目标
+`ic_strength_return_score` 亦同口径（`|ic_mean|` 0.7 + 毛Sharpe 0.3）。
+
+#### 3.4.2 类型系统 `types_core/`（2026-10-21 引入，量纲 + 语义分层类型）
+
+纯 stdlib 共享库（零 fuxi_v1 内部依赖），`fuxi_v1` 与 `factor_mining` 两侧复用同一规则表：
+
+| 模块 | 职责 |
+|---|---|
+| `spec.py` | `TypeSpec`（dim/form/family/horizon/shape/direction）+ 量纲指数代数 + 合并规则 + `UNIT_DIMENSIONS` 单点 |
+| `registry.py` | 字段级（10）+ 因子级（97）显式注册 + 名称模式推断 + `resolve()` 四级解析（覆盖>模式>显式>fallback） |
+| `rules.py` | 算子规则三档（hard 硬拒 / soft 软罚 / open 放开）+ 违规码 |
+| `infer.py` | 双前端推断（AST 递归 / preorder 前缀）+ `TypeState` 增量状态 + `mask_actions` 动作掩码 |
+
+分层类型：`dim` 沿用 dsl UNITS 量纲（字段级区分），`form/family/horizon/shape/direction` 是因子级语义主轴
+（form=测度形态 level/ratio/return/flow/dispersion/score/bounded/ranked，family=经济角色
+value/quality/momentum/...，shape=有界性/div 分母安全，direction=先验方向 note-only，运行时真值=IC 符号检测）。
+
+算子纪律（借 dsl 两条硬纪律，约束强度由算子决定）：
+- `add/sub`：两侧同 form 硬禁（可证伪类型错误），跨 family/horizon 跨档软罚；
+- `mul/div`：跨 family 放开（交互项是因子工程意义来源）；div 分母 signed 硬禁 + 自除硬禁；
+- `rank/zscore/ts_zscore`：类型归一器（输出无条件标准化）。
+
+接线点（均带独立 env 开关，off=逐位不变）：
+
+| 接线 | 位置 | 开关 |
+|---|---|---|
+| W1 垃圾前置 | `dsl.compile_ast` | `FUXI_TYPE_GATE` |
+| W2 GA 变异升 type_groups | `ga_ops` | `FUXI_TYPE_GROUPS` |
+| W3 动作掩码 | `factor_mining.gflownet` | `FUXI_TYPE_MASK` |
+| W4 诊断上浮 | `research_evaluation` + `acceptance` | `FUXI_TYPE_NOTES` |
+
+🔴 **内联约束**：`contracts.py/data.py/dsl.py` 被 `jq.py.compile_diagnostic` 源码内联（过滤相对导入），
+必须内联自包含、**不能依赖 types_core 包**（量纲格硬编码 + 注释指向 `spec.UNIT_DIMENSIONS` 单点）。
 
 ### 3.5 评估层（E 道）
 
@@ -312,6 +391,17 @@ for round_index in range(rounds):
 | `FUXI_V1_POOL_SIZE` | `2` | 池大小（推荐 4） |
 | `FUXI_V1_POOL_MAX_REQUESTS` | `8` | 每 slot 处理多少请求后 recycle（推荐 40） |
 
+### 6.3 类型系统开关（types_core，2026-10-21）
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `FUXI_TYPE_GATE` | `off` | W1：`compile_ast` 语义垃圾前置（hard 违规编译拒） |
+| `FUXI_TYPE_MASK` | `off` | W3：GFlowNet 采样动作掩码（类型栈收窄动作集） |
+| `FUXI_TYPE_NOTES` | `off` | W4：factor_notes 加 output_type + E2 family 冗余诊断（note-only） |
+| `FUXI_TYPE_SOFT_PENALTY` | `off` | P2：类型软违规乘性入 GFlowNet reward（需先消融） |
+| `FUXI_TYPE_GROUPS` | `off` | W2：GA 变异 unit_groups → type_groups（dim+form 分组） |
+| `FUXI_TYPES_OVERRIDE` | 空 | 外部增量覆盖 JSON 路径（新因子人工标注，不改源码） |
+
 ### 6.2 预算常量（代码内）
 
 `fuxi_v1/ga_ops.py`：
@@ -392,6 +482,8 @@ data/
 | 版本 | 日期 | 要点 |
 |---|---|---|
 | **v2.0** | 2026-10-18 | 产品定版：快照 hash 抽样修复、GA 默认 on、M1/M2 提速 3.2x、E1 通过率 22–25% |
+| **v2.1** | 2026-10-20 | 慢循环落地 + E1 单调性/适用性/regime/市值分段 + 预算提速 |
+| **v2.2** | 2026-10-21 | 量纲语法系统（types_core）+ GFlowNet 生产臂（第 6 臂）+ factor_mining 旁挂库 |
 
 详细工程批次见 `CHANGELOG.md` 与 `data/version_registry.json`。
 

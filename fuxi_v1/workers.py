@@ -53,7 +53,8 @@ def _evaluate_with(request, payload, snapshot, labels):
                                 request["top_n"], request["algorithm"], request["seed"])
     scores = evaluate_ast(request["candidate"]["canonical_ast"], snapshot)
     baseline = evaluate_ast(request["baseline_ast"], snapshot)
-    pool_scores = [{"candidate_id": p["candidate_id"], "scores": evaluate_ast(p["canonical_ast"], snapshot)}
+    pool_scores = [{"candidate_id": p["candidate_id"], "canonical_ast": p["canonical_ast"],
+                    "scores": evaluate_ast(p["canonical_ast"], snapshot)}
                    for p in request.get("pool_candidates", [])]
     result = evaluate_candidate(request["candidate"], scores, baseline, snapshot, labels, payload["market"],
                                 request["policy"], payload["research_clock"], top_n=request["top_n"],

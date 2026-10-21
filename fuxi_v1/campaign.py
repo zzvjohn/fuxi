@@ -618,7 +618,7 @@ def choose_arm(round_index, mode, history, llm_enabled, min_exploration="enforce
     # P-20261017: `random`（shuffle 模板）降级为 fixed 的 shuffle_order flag，从臂列表移除；
     # `random_ast` 升入臂列表作真·随机探索臂（完整合法空间 + 零假设校准），提前到第 2 轮，
     # 修「冷启动阶段产出几乎全在模板空间」的多样性天花板。llm 保持末尾（外部依赖 + 预算）。
-    arms = ["fixed", "random_ast", "refine", "combine"] + (["regime_combine"] if gen_expand == "expanded" else []) + (["llm"] if llm_enabled else [])
+    arms = ["fixed", "random_ast", "refine", "combine", "gflownet"] + (["regime_combine"] if gen_expand == "expanded" else []) + (["llm"] if llm_enabled else [])
     if mode == "fixed":
         return "fixed", {"rule": "fixed_baseline", "scores": {}}
     if mode == "no_memory":
@@ -911,7 +911,7 @@ def run_campaign(input_path, output_root, *, rounds=5, candidates_per_round=3, m
                 'study protocol fields differ')
         require(study_protocol['schema_version']=='fuxi.controlled_study.1', 'unknown study protocol')
         schedule = study_protocol['arm_schedule']
-        require(len(schedule)==rounds and all(a in {'fixed','random','refine','combine','llm','random_ast','refine_local','llm_patch'} for a in schedule),
+        require(len(schedule)==rounds and all(a in {'fixed','random','refine','combine','gflownet','llm','random_ast','refine_local','llm_patch'} for a in schedule),
                 'frozen emitter schedule required')
         require(study_protocol['max_trials'] >= rounds*candidates_per_round and
                 type(study_protocol['checkpoint_every']) is int and 1 <= study_protocol['checkpoint_every'] <= rounds,

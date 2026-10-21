@@ -4,6 +4,11 @@ from copy import deepcopy
 from datetime import date
 from .contracts import digest, keys, require, finite, nonempty, timestamp
 
+# C2 软收敛：合法 unit 集合真值源 = types_core.spec.VALID_UNITS（单点）。
+# 本处保留硬编码是因为 jq.py.compile_diagnostic 会把 data.py 源码内联（过滤 `from .`
+# 相对导入），data.py 必须内联自包含、不能依赖 types_core 包。改量纲格时两处同步改。
+_VALID_UNITS = {"price", "shares", "ratio", "currency"}
+
 
 def snapshot_from_payload(payload):
     """Use the declared schema; compact history retains action-lookback barriers."""
@@ -53,7 +58,7 @@ class Snapshot:
         for name, spec in p["fields"].items():
             require(nonempty(name), "invalid field name")
             keys(spec, ("unit", "adjustment", "frequency"))
-            require(spec["unit"] in {"price", "shares", "ratio", "currency"}, "unsupported unit")
+            require(spec["unit"] in _VALID_UNITS, "unsupported unit")
             require(spec["frequency"] == "daily", "only daily fields supported")
             require(spec["adjustment"] in {"raw", "not_applicable"},
                     "adjusted prices require a future revision-aware adapter")

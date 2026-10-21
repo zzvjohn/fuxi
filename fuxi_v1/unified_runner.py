@@ -22,8 +22,8 @@ from .artifacts import code_manifest
 from .effective_config import collect_effective_config
 
 SCHEMA='fuxi.unified_run.1'
-DEFAULT_LIMITS={'max_rounds':40,'max_candidates':80,'max_worker_seconds':420,
-                'max_total_seconds':36000,'max_memory_mb':2048,
+DEFAULT_LIMITS={'max_rounds':40,'max_candidates':80,'max_worker_seconds':600,
+                'max_total_seconds':50000,'max_memory_mb':2048,
                 'max_external_requests':30,'max_llm_calls':12,'max_output_tokens':24000}
 
 def file_sha(path):

@@ -1,6 +1,8 @@
 """Native E0-E4 evidence. Research diagnostics and identified account evidence stay separate."""
 
 from statistics import mean
+import os
+
 from .contracts import evaluation, digest, require
 from .evaluation import DEFAULT_POLICY, factor_statistics, correlation
 from .statistics import block_inference, performance
@@ -198,7 +200,24 @@ def residual_rank_ic(scores, other_scores, snapshot, labels, clock, start, end):
     return rows
 
 
-def pool_redundancy(scores, pool_scores, snapshot, labels, clock, start, end, request, *, corr_threshold=0.7):
+def _semantic_redundancy_note(candidate_ast, pool_ast):
+    """G3: 候选与 pool 因子是否同 family（note-only 诊断，供观察误杀率）。
+
+    FUXI_TYPE_NOTES=off 返回 None（不改任何 decision）；on 时返回诊断 dict。
+    观察期语义：同 family + 相关>0.7 的候选标注 redundancy_semantic，但仅诊断、
+    不升门控——待误杀率（被标注但 E1-E4 全过的候选占比）< 5% 才考虑升门控。
+    """
+    if os.environ.get("FUXI_TYPE_NOTES", "off") != "on":
+        return None
+    from .types_core import infer_ast, resolve
+    cand_spec, _ = infer_ast(candidate_ast, lambda n: resolve(n, kind="field"))
+    pool_spec, _ = infer_ast(pool_ast, lambda n: resolve(n, kind="field"))
+    same = cand_spec.family == pool_spec.family and cand_spec.family != "none"
+    return {"same_family": same, "candidate_family": cand_spec.family,
+            "pool_family": pool_spec.family, "redundancy_semantic": same}
+
+
+def pool_redundancy(scores, pool_scores, snapshot, labels, clock, start, end, request, *, corr_threshold=0.7, candidate_ast=None):
     """E2 pool-redundancy gate: reject candidates that duplicate an admitted factor.
 
     A candidate with max |rank correlation| against the pool below corr_threshold
@@ -226,11 +245,16 @@ def pool_redundancy(scores, pool_scores, snapshot, labels, clock, start, end, re
         if c is None:
             continue
         if best is None or c > best["corr"]:
-            best = {"candidate_id": member["candidate_id"], "corr": c, "scores": member["scores"]}
+            best = {"candidate_id": member["candidate_id"], "corr": c, "scores": member["scores"],
+                    "canonical_ast": member.get("canonical_ast")}
     if best is None:
         return {"decision": "pass", "reject_class": None, "reason_code": "no_comparable_pool_member",
                 "pool_size": len(pool_scores), "corr_threshold": corr_threshold}
     max_corr = best["corr"]
+    # G3 语义冗余诊断（note-only，不影响 decision）：同 family + 相关>0.7 标注 redundancy_semantic，
+    # 观察 2 周误杀率后再决定是否升门控。
+    semantic = (_semantic_redundancy_note(candidate_ast, best.get("canonical_ast"))
+                if candidate_ast is not None else None)
     if max_corr < corr_threshold:
         return {"decision": "pass", "reject_class": None, "reason_code": "independent_of_pool",
                 "pool_size": len(pool_scores), "max_corr": max_corr, "corr_threshold": corr_threshold}
@@ -238,7 +262,8 @@ def pool_redundancy(scores, pool_scores, snapshot, labels, clock, start, end, re
     if not residual_ic:
         return {"decision": "reject", "reject_class": "redundancy",
                 "reason_code": "redundant_no_residual_support", "redundant_with": best["candidate_id"],
-                "pool_size": len(pool_scores), "max_corr": max_corr, "corr_threshold": corr_threshold}
+                "pool_size": len(pool_scores), "max_corr": max_corr, "corr_threshold": corr_threshold,
+                "semantic_redundancy": semantic}
     from .research_protocol import inference
     interval = inference(residual_ic, request, 20261018)
     if interval["status"] == "valid" and interval["lower"] > 0:
@@ -249,11 +274,30 @@ def pool_redundancy(scores, pool_scores, snapshot, labels, clock, start, end, re
         return {"decision": "pass", "reject_class": None,
                 "reason_code": "high_corr_but_independent_residual_alpha", "redundant_with": best["candidate_id"],
                 "pool_size": len(pool_scores), "max_corr": max_corr, "residual_alpha": interval,
-                "corr_threshold": corr_threshold}
+                "corr_threshold": corr_threshold, "semantic_redundancy": semantic}
     return {"decision": "reject", "reject_class": "redundancy",
             "reason_code": "redundant_with_pool_factor", "redundant_with": best["candidate_id"],
             "pool_size": len(pool_scores), "max_corr": max_corr, "residual_alpha": interval,
-            "corr_threshold": corr_threshold}
+            "corr_threshold": corr_threshold, "semantic_redundancy": semantic}
+
+
+def _output_type_note(candidate):
+    """FUXI_TYPE_NOTES=on 时返回 output_type 诊断 dict，off 返回 None（note-only）。
+
+    治理 C8 断头：compile_ast 产出的量纲/语义类型信息此前算完即弃；此处把
+    TypeSpec（dim/form/family/horizon/shape/direction）+ soft 违规码上浮进
+    factor_notes，供多因子合成阶段按 family 做条件化，不影响 pass/reject。
+    """
+    if os.environ.get("FUXI_TYPE_NOTES", "off") != "on":
+        return None
+    from .types_core import infer_ast, resolve
+    spec, type_violations = infer_ast(candidate["canonical_ast"],
+                                      lambda n: resolve(n, kind="field"))
+    return {
+        "dim": list(spec.dim), "form": spec.form, "family": spec.family,
+        "horizon": spec.horizon, "shape": spec.shape, "direction": spec.direction,
+        "soft_violations": [v.code for v in type_violations if v.severity == "soft"],
+    }
 
 
 def evaluate_candidate(candidate, scores, baseline_scores, snapshot, labels, market, policy, clock, *, top_n=6, baseline_cache=None, pool_scores=(), industry_map=None, regime_by_session=None, cap_by_session=None):
@@ -319,6 +363,10 @@ def evaluate_candidate(candidate, scores, baseline_scores, snapshot, labels, mar
                                        industry_map=industry_map, regime_by_session=regime_by_session,
                                        cap_by_session=cap_by_session)
     factor_notes["monotonicity"] = monotonicity  # note-only 形状诊断，与 regime/cap/industry 并列
+    # P2 类型信息上浮（C8 治理）：output_type 段（note-only，不改 decision）。
+    output_type = _output_type_note(candidate)
+    if output_type is not None:
+        factor_notes["output_type"] = output_type
     try:
         similarity = paired_scores(scores, baseline_scores, start, end)
         e2 = evaluation("E2", "valid", "independence_description_pending_economic_increment",
@@ -330,7 +378,8 @@ def evaluate_candidate(candidate, scores, baseline_scores, snapshot, labels, mar
                 {"frozen_momentum20":baseline_scores,"raw_price_cv20":style},labels,snapshot,clock)
         # E2 is now a real pool-redundancy gate (P-20261018-014): the decision is
         # made independently against the already-admitted pool, never mirrored from E3.
-        redundancy = pool_redundancy(scores, pool_scores, snapshot, labels, clock, start, end, request)
+        redundancy = pool_redundancy(scores, pool_scores, snapshot, labels, clock, start, end, request,
+                                     candidate_ast=candidate["canonical_ast"])
         e2["diagnostics"]["pool_redundancy"] = redundancy
         e2.update(decision=redundancy["decision"], reject_class=redundancy["reject_class"],
                   reason_code=redundancy["reason_code"])

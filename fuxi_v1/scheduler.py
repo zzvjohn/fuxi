@@ -16,7 +16,7 @@ def counters(history, arm):
 
 def choose(round_index, mode, history, llm_enabled, *, context_hash, empty_limit=2):
     require(mode in {'adaptive', 'fixed', 'no_memory'} and empty_limit >= 1, 'scheduler policy invalid')
-    arms = ['fixed', 'random', 'refine', 'combine'] + (['llm'] if llm_enabled else [])
+    arms = ['fixed', 'random', 'refine', 'combine', 'gflownet'] + (['llm'] if llm_enabled else [])
     if mode == 'fixed':
         arms = ['fixed']
     elif mode == 'no_memory':
