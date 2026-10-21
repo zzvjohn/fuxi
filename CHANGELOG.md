@@ -5,6 +5,12 @@
 
 ## [2.2.0] - 2026-10-21
 
+### 版本记录（工程批次账本同步）
+- 工程批次账本 `data/version_registry.json` 同步登记 **v0.7.219（2026-10-21，2 提案）**：
+  `P-20261021-001` 量纲语法系统 types_core 落地、`P-20261021-002` GFlowNet 生产臂（第 6 臂）入 UCB。
+  源树 `CHANGELOG.md`（`scripts/version_bump.py --render` 生成）已重渲染至 **220 个版本 / 375 条已落地提案全部编号**。
+  发布仓 README 工程账本引用同步至 v0.7.219。
+
 ### Added
 - **量纲语法系统 `types_core/`**（2026-10-21 引入，量纲 + 语义分层类型）：
   `spec.py`（TypeSpec + 量纲指数代数 + UNIT_DIMENSIONS 单点）、`registry.py`（字段级 10 + 因子级 97 显式注册 +
